@@ -86,6 +86,10 @@
           - pipewire-pulse
           - wireplumber
           - network-manager
+          # polkit evaluates 50-pireplace.rules; dbus-user-session gives the lingering
+          # pireplace user manager its session bus (PipeWire, systemctl --user -M).
+          - polkitd
+          - dbus-user-session
           - avahi-daemon
           - python3
           - unattended-upgrades
@@ -93,18 +97,20 @@
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Limit unattended-upgrades to the security origin
+    - name: Limit unattended-upgrades to security updates (Debian and Raspberry Pi)
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/52pireplace-unattended-upgrades
         owner: root
         group: root
         mode: "0644"
         content: |
-          // Managed by Ansible. Replaces the default origin list with security only.
+          // Managed by Ansible. Replaces the default origin list: Debian security
+          // updates plus the Raspberry Pi archive (kernel/firmware fixes ship there).
           #clear Unattended-Upgrade::Origins-Pattern;
           Unattended-Upgrade::Origins-Pattern {
               "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
               "origin=Debian,codename=${distro_codename},label=Debian-Security";
+              "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
           };
 
     - name: Enable the daily unattended-upgrades run
@@ -258,22 +264,30 @@
     - name: Apply tmpfiles and systemd changes now
       ansible.builtin.meta: flush_handlers
 
-    - name: Enable PipeWire for user sessions
+    # Enable per user, for pireplace only, so an admin's SSH login never starts the
+    # players. Debian's pipewire packages already enable PipeWire for every user (socket
+    # activated: idle until something plays audio); that OS default is left alone, and
+    # `is-enabled` then reports it as enabled here, which is all the players need.
+    - name: Undo the every-user enablement of the player units from older playbooks
       ansible.builtin.systemd_service:
         name: "{{ item }}"
-        enabled: true
-        scope: global
-      loop:
-        - pipewire.socket
-        - pipewire-pulse.socket
-        - wireplumber.service
-
-    - name: Enable the player units for every user manager
-      ansible.builtin.systemd_service:
-        name: "{{ item }}"
-        enabled: true
+        enabled: false
         scope: global
       loop: "{{ pireplace_user_units }}"
+
+    - name: Enable PipeWire and the player units for the pireplace user
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for unit in pipewire.socket pipewire-pulse.socket wireplumber.service {{ pireplace_user_units | join(' ') }}; do
+            if ! systemctl --user --machine={{ pireplace_user }}@.host is-enabled --quiet "$unit"; then
+              systemctl --user --machine={{ pireplace_user }}@.host enable "$unit"
+              echo "enabled $unit"
+            fi
+          done
+        executable: /bin/bash
+      register: pireplace_user_enable
+      changed_when: "'enabled ' in pireplace_user_enable.stdout"
 
     - name: Enable and start NetworkManager and Avahi
       ansible.builtin.systemd_service:
@@ -300,18 +314,27 @@
         regexp: '^(?!.*\bquiet loglevel=3 logo\.nologo vt\.global_cursor_default=0 consoleblank=0\b)(.*?)\s*$'
         line: '\1 {{ pireplace_cmdline_args }}'
         backrefs: true
+      register: pireplace_cmdline
 
     - name: Disable the firmware splash (takes effect after a reboot)
       ansible.builtin.lineinfile:
         path: /boot/firmware/config.txt
         regexp: '^#?\s*disable_splash='
         line: disable_splash=1
+      register: pireplace_configtxt
 
     - name: Disable the login prompt on tty1
       ansible.builtin.systemd_service:
         name: getty@tty1.service
         masked: true
         state: stopped
+
+    - name: Tell the operator to reboot
+      ansible.builtin.debug:
+        msg: >-
+          REBOOT REQUIRED: /boot/firmware/cmdline.txt or config.txt changed. Run
+          `sudo reboot` on the Pi so the TV shows only the fire.
+      when: pireplace_cmdline is changed or pireplace_configtxt is changed
 
   handlers:
     - name: Reload systemd

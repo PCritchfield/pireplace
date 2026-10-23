@@ -2,6 +2,8 @@
 Description=pireplace Wi-Fi setup hotspot watcher
 After=NetworkManager.service
 Wants=NetworkManager.service
+# Never stop restarting, however often it fails (the default gives up after 5 starts in 10 s).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -33,6 +35,14 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 [Install]
