@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from dataclasses import replace
 from pathlib import Path
@@ -10,7 +11,12 @@ from typing import Callable
 from pireplace.config import Config
 from pireplace.library import find_moods, find_videos, mood_label
 from pireplace.mpv import MpvClient, MpvError, MpvUnavailable
-from pireplace.state import StateStore
+from pireplace.state import State, StateStore
+
+log = logging.getLogger(__name__)
+
+BOOT_MARKER = "boot-done"  # lives in the runtime socket dir (tmpfs: gone after a reboot)
+PLAYERS = ("video", "music")
 
 
 class UnknownMood(Exception):
@@ -36,6 +42,10 @@ class Fireplace:
         self.video = video
         self.music = music
         self._shuffle = shuffle
+        self._boot_marker = Path(config.music_socket).parent / BOOT_MARKER
+        self._boot: bool | None = None  # decided on the first reconcile
+        self._pids: dict[str, object] = {}  # last mpv pid seen per player
+        self._down: set[str] = set()  # players whose last reconcile failed (log once)
 
     # -- helpers ---------------------------------------------------------
 
@@ -50,6 +60,7 @@ class Fireplace:
     @staticmethod
     def _load(player: MpvClient, files: list[Path]) -> None:
         if not files:
+            player.command("stop")  # clear a stale playlist rather than keep playing it
             return
         player.command("loadfile", str(files[0]), "replace")
         for f in files[1:]:
@@ -62,31 +73,82 @@ class Fireplace:
         return next(iter(moods), None)
 
     def _update(self, **changes) -> None:
-        self.store.save(replace(self.store.load(), **changes))
+        old = self.store.load()
+        self._save_if_changed(old, replace(old, **changes))
+
+    def _save_if_changed(self, old: State, new: State) -> None:
+        if new != old:  # no SD-card write when nothing changed
+            self.store.save(new)
 
     # -- lifecycle -------------------------------------------------------
 
-    def startup(self) -> None:
-        state = self.store.load()
-        if self.video.get("playlist-count") == 0:
-            self._load_videos()
+    def reconcile(self) -> None:
+        """Bring each player in line with the saved state. Safe to call every few seconds.
+
+        Per player, keyed on mpv's `pid`:
+        - same pid as last round: nothing to do (no commands, no writes);
+        - first sight during a boot (no boot marker), or a new pid (mpv restarted):
+          boot defaults - log sound on, music playing unless start_music is false;
+        - first sight after a controller restart (marker present): the persisted state.
+        Either way an empty player is (re)loaded. A player that is down or errors is
+        skipped this round; the other is still handled.
+        """
+        if self._boot is None:
+            self._boot = not self._boot_marker.exists()
+        before = state = self.store.load()
+        for name, player, apply in (
+            ("video", self.video, self._apply_video),
+            ("music", self.music, self._apply_music),
+        ):
+            try:
+                pid = player.get("pid")
+                self._down.discard(name)
+                last = self._pids.get(name)
+                if last is not None and pid == last:
+                    continue
+                restarted = last is not None
+                state = apply(state, boot_defaults=self._boot or restarted)
+            except (MpvUnavailable, MpvError, OSError) as e:
+                if name not in self._down:
+                    log.warning("%s player not ready, will retry: %s", name, e)
+                    self._down.add(name)
+                continue
+            self._pids[name] = pid
+            log.info("%s player %s (pid %s)", name, "restarted, set up again" if restarted else "set up", pid)
+        self._save_if_changed(before, state)
+        if self._boot and all(p in self._pids for p in PLAYERS):
+            self._boot = False
+            try:
+                self._boot_marker.touch()
+            except OSError as e:
+                log.warning("cannot write boot marker %s: %s", self._boot_marker, e)
+
+    def _apply_video(self, state: State, boot_defaults: bool) -> State:
+        if boot_defaults:
+            state = replace(state, log_muted=False)
         self.video.set("volume", state.log_volume)
         self.video.set("mute", state.log_muted)
+        if self.video.get("playlist-count") == 0:
+            self._load_videos()
+        return state
 
+    def _apply_music(self, state: State, boot_defaults: bool) -> State:
         moods = find_moods(self.config.music_dir)
         mood = self._resolve_mood(state.mood, moods)
-        if mood is not None and self.music.get("playlist-count") == 0:
-            self._load_music(moods[mood])
+        state = replace(state, mood=mood)
+        if boot_defaults:
+            state = replace(state, music_playing=self.config.start_music)
         self.music.set("volume", state.music_volume)
         self.music.set("pause", not state.music_playing)
-        self.store.save(replace(state, mood=mood))
+        if self.music.get("playlist-count") == 0:
+            self._load_music(moods[mood] if mood is not None else [])
+        return state
 
     def rescan(self) -> None:
         self._load_videos()
         moods = find_moods(self.config.music_dir)
         mood = self._resolve_mood(self.store.load().mood, moods)
-        if mood is not None:
-            self._load_music(moods[mood])
+        self._load_music(moods[mood] if mood is not None else [])
         self._update(mood=mood)
 
     # -- status ----------------------------------------------------------
@@ -106,9 +168,10 @@ class Fireplace:
                 title = self.music.get("media-title")
             except MpvError:  # idle mpv has no title
                 title = None
+            idle = self.music.get("playlist-count") == 0
             music = {
                 "available": True,
-                "playing": not self.music.get("pause"),
+                "playing": not idle and not self.music.get("pause"),
                 "volume": round(self.music.get("volume")),
                 "now_playing": title or None,
             }

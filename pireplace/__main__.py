@@ -12,7 +12,7 @@ from typing import Callable
 
 from pireplace.config import ConfigError, load_config
 from pireplace.controller import Fireplace
-from pireplace.mpv import MpvClient, MpvError, MpvUnavailable
+from pireplace.mpv import MpvClient
 from pireplace.state import State, StateStore
 from pireplace.web import make_server
 from pireplace.wifi import (
@@ -28,38 +28,37 @@ from pireplace.wifi import (
 
 log = logging.getLogger("pireplace")
 
-RETRY_S = 2
+RECONCILE_S = 5
 LOG_EVERY_S = 60
 DEFAULT_CONFIG = "/etc/pireplace/config.toml"
 
 
-def startup_with_retry(
+def reconcile_forever(
     fireplace: Fireplace,
     stop: threading.Event,
     lock: threading.Lock,
+    interval: float = RECONCILE_S,
     sleep: Callable[[float], bool] | None = None,
 ) -> None:
-    """Call fireplace.startup() every RETRY_S seconds until both players answer.
+    """Call fireplace.reconcile() every `interval` seconds for the life of the server.
 
-    `sleep(seconds)` returns True if asked to stop; defaults to stop.wait.
-    Each attempt holds `lock` (shared with the web server); the sleep never does.
-    Failures are logged on the first attempt and then once per minute.
+    This is what brings a restarted mpv back to a playing fire. `sleep(seconds)` returns
+    True when asked to stop; defaults to stop.wait. Each call holds `lock` (shared with
+    the web server); the sleep never does. Errors are logged at most once per minute
+    and never end the loop.
     """
     sleep = sleep or stop.wait
     last_logged = None
     while True:
         try:
             with lock:
-                fireplace.startup()
-        except (MpvUnavailable, MpvError, OSError) as e:
+                fireplace.reconcile()
+        except Exception:
             now = time.monotonic()
             if last_logged is None or now - last_logged >= LOG_EVERY_S:
-                log.warning("players not ready, retrying every %ds: %s", RETRY_S, e)
+                log.exception("reconcile failed, retrying every %ss", interval)
                 last_logged = now
-            if sleep(RETRY_S):
-                return
-        else:
-            log.info("players ready, startup complete")
+        if sleep(interval):
             return
 
 
@@ -91,10 +90,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 1
 
     stop = threading.Event()
-    starter = threading.Thread(
-        target=startup_with_retry, args=(fireplace, stop, server.fireplace_lock), name="startup", daemon=True
+    reconciler = threading.Thread(
+        target=reconcile_forever, args=(fireplace, stop, server.fireplace_lock), name="reconcile", daemon=True
     )
-    starter.start()
+    reconciler.start()
     log.info("serving on http://%s:%d", config.host, config.port)
     try:
         server.serve_forever()

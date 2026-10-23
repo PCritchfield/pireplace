@@ -18,7 +18,7 @@ python="python3"
 "$root/scripts/make_sample_media.sh"
 
 mkdir -p .dev/run
-rm -f .dev/run/video.sock .dev/run/music.sock
+rm -f .dev/run/video.sock .dev/run/music.sock .dev/run/boot-done  # each dev run is a fresh boot
 
 pids=()
 cleanup() {

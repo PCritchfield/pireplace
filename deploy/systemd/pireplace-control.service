@@ -20,6 +20,10 @@ StateDirectory=pireplace
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
+# /run/pireplace holds the mpv sockets and the boot-done marker (tmpfs, cleared on reboot)
+# that tells a fresh boot from a controller restart. Created by tmpfiles.d/pireplace.conf.
+ReadWritePaths=-/run/pireplace
+
 # Hardening. Network and AF_UNIX stay open: port 80, the mpv sockets in /run/pireplace,
 # and the system D-Bus (nmcli, for the Wi-Fi setup page).
 NoNewPrivileges=yes

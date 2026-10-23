@@ -9,7 +9,9 @@ Wants=pipewire.service
 # depend on user namespaces that a user manager may not have.
 Type=simple
 NoNewPrivileges=yes
-ExecStart=/usr/bin/mpv --vo=gpu --gpu-context=drm --hwdec=auto-safe --fullscreen --idle=yes --loop-playlist=inf --no-osc --osd-level=0 --no-input-default-bindings --input-ipc-server=/run/pireplace/video.sock --really-quiet
+# The video folder is on the command line so the fire plays even if the controller is down;
+# the controller then only applies volume/mute (and reloads after a rescan).
+ExecStart=/usr/bin/mpv --vo=gpu --gpu-context=drm --hwdec=auto-safe --fullscreen --idle=yes --loop-playlist=inf --no-osc --osd-level=0 --no-input-default-bindings --input-ipc-server=/run/pireplace/video.sock --really-quiet /srv/pireplace/videos
 Restart=always
 RestartSec=2
 

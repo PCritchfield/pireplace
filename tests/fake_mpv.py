@@ -12,7 +12,8 @@ class FakeMpv:
         self.socket_path = Path(socket_path)
         self.emit_events = emit_events
         self.props: dict = {}
-        self.commands: list[list] = []
+        self.commands: list[list] = []  # everything except get/set_property
+        self.requests: list[list] = []  # every request, in order
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -55,6 +56,15 @@ class FakeMpv:
                 except OSError:
                     pass
 
+    def _track_playlist(self, args: list) -> None:
+        """Mimic mpv's playlist-count for loadfile/stop, if the test seeded the property."""
+        if "playlist-count" not in self.props:
+            return
+        if args[0] == "loadfile":
+            self.props["playlist-count"] = 1 if args[2] == "replace" else self.props["playlist-count"] + 1
+        elif args[0] == "stop":
+            self.props["playlist-count"] = 0
+
     def _handle(self, conn: socket.socket) -> None:
         buf = b""
         while b"\n" not in buf:
@@ -64,6 +74,7 @@ class FakeMpv:
             buf += chunk
         request = json.loads(buf.split(b"\n", 1)[0])
         args = request["command"]
+        self.requests.append(args)
         reply = {"request_id": request.get("request_id"), "error": "success", "data": None}
         if args[0] == "get_property":
             if args[1] in self.props:
@@ -74,6 +85,7 @@ class FakeMpv:
             self.props[args[1]] = args[2]
         else:
             self.commands.append(args)
+            self._track_playlist(args)
         out = b""
         if self.emit_events:
             out += json.dumps({"event": "property-change", "name": "volume"}).encode() + b"\n"

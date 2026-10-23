@@ -3,8 +3,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from pireplace.__main__ import main, startup_with_retry
-from pireplace.mpv import MpvError, MpvUnavailable
+from pireplace.__main__ import main, reconcile_forever
+from pireplace.mpv import MpvUnavailable
 
 
 def test_bad_config_exits_2(tmp_path, capsys):
@@ -26,50 +26,58 @@ def test_no_subcommand_is_usage_error():
     assert e.value.code == 2
 
 
-def test_startup_retries_until_players_answer():
+def _sleeper(rounds):
+    """sleep() stand-in: records intervals and asks to stop after `rounds` calls."""
+    slept = []
+
+    def sleep(s):
+        slept.append(s)
+        return len(slept) >= rounds
+
+    return sleep, slept
+
+
+def test_reconcile_loop_runs_every_interval_until_stopped():
     fp = Mock()
-    fp.startup.side_effect = [MpvUnavailable("a"), MpvError("b"), None]
-    sleeps = []
-    startup_with_retry(fp, threading.Event(), threading.Lock(), sleep=lambda s: sleeps.append(s) or False)
-    assert fp.startup.call_count == 3
-    assert sleeps == [2, 2]
+    sleep, slept = _sleeper(3)
+    reconcile_forever(fp, threading.Event(), threading.Lock(), sleep=sleep)
+    assert fp.reconcile.call_count == 3
+    assert slept == [5, 5, 5]
 
 
-def test_startup_retry_stops_when_asked():
+def test_reconcile_interval_is_injectable():
     fp = Mock()
-    fp.startup.side_effect = MpvUnavailable("down")
-    stop = threading.Event()
-
-    def sleep(_s):
-        stop.set()
-        return True
-
-    startup_with_retry(fp, stop, threading.Lock(), sleep=sleep)
-    assert fp.startup.call_count == 1
+    sleep, slept = _sleeper(2)
+    reconcile_forever(fp, threading.Event(), threading.Lock(), interval=0.5, sleep=sleep)
+    assert slept == [0.5, 0.5]
 
 
-def test_startup_attempts_hold_the_lock_but_sleep_does_not():
+def test_reconcile_loop_survives_any_error(caplog):
+    fp = Mock()
+    fp.reconcile.side_effect = [MpvUnavailable("a"), OSError("disk"), RuntimeError("bug"), None]
+    sleep, _ = _sleeper(4)
+    reconcile_forever(fp, threading.Event(), threading.Lock(), sleep=sleep)
+    assert fp.reconcile.call_count == 4
+    assert "reconcile failed" in caplog.text
+
+
+def test_reconcile_holds_the_lock_but_sleep_does_not():
     lock = threading.Lock()
-    held_during = []
+    seen = []
     fp = Mock()
-
-    def startup():
-        held_during.append(lock.locked())
-        if len(held_during) == 1:
-            raise MpvUnavailable("down")
-
-    fp.startup.side_effect = startup
+    fp.reconcile.side_effect = lambda: seen.append(lock.locked())
 
     def sleep(_s):
-        held_during.append(("sleep", lock.locked()))
-        return False
+        seen.append(("sleep", lock.locked()))
+        return len(seen) >= 4
 
-    startup_with_retry(fp, threading.Event(), lock, sleep=sleep)
-    assert held_during == [True, ("sleep", False), True]
+    reconcile_forever(fp, threading.Event(), lock, sleep=sleep)
+    assert seen == [True, ("sleep", False), True, ("sleep", False)]
 
 
-def test_startup_retries_on_oserror_and_keeps_going():
+def test_reconcile_default_sleep_waits_on_stop_event():
     fp = Mock()
-    fp.startup.side_effect = [FileNotFoundError("music dir"), None]
-    startup_with_retry(fp, threading.Event(), threading.Lock(), sleep=lambda s: False)
-    assert fp.startup.call_count == 2
+    stop = threading.Event()
+    stop.set()
+    reconcile_forever(fp, stop, threading.Lock())
+    assert fp.reconcile.call_count == 1
