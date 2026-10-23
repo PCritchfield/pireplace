@@ -38,6 +38,10 @@ lint: ## Playbook syntax check, ansible-lint, systemd-analyze verify (reports wh
 		echo "systemd-analyze: units OK (missing-binary warnings ignored: mpv is installed on the Pi, not here)"; \
 	else echo "SKIPPED: systemd-analyze not installed (unit verify not run)"; fi
 
+.PHONY: card
+card: ## Printable QR card: HOTSPOT_PASSWORD=... make card (writes build/card.html)
+	./scripts/make_card.sh
+
 .PHONY: deploy
 deploy: ## Provision the Pi: make deploy HOST=pireplace.local (or INVENTORY=path)
 	@test -n "$(INVENTORY)$(HOST)" || { echo "usage: make deploy HOST=pireplace.local  (or INVENTORY=path)"; exit 2; }
