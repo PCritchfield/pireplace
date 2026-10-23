@@ -83,8 +83,8 @@ class Srv:
         self.port = httpd.server_address[1]
 
 
-def _start(stub, extra=None):
-    httpd = make_server(stub, "127.0.0.1", 0, extra=extra)
+def _start(stub, extra=None, **kw):
+    httpd = make_server(stub, "127.0.0.1", 0, extra=extra, **kw)
     t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     t.start()
     return Srv(stub, httpd), t
@@ -103,10 +103,16 @@ def srv():
     _stop(s, t)
 
 
-def request(srv, method, path, body=None):
+JSON = {"Content-Type": "application/json"}
+
+
+def request(srv, method, path, body=None, headers=None):
+    """POSTs send Content-Type: application/json unless `headers` says otherwise."""
+    if headers is None:
+        headers = JSON if method == "POST" else {}
     conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
     try:
-        conn.request(method, path, body=body)
+        conn.request(method, path, body=body, headers=headers)
         r = conn.getresponse()
         return r.status, r.read(), r.getheader("Content-Type") or ""
     finally:
@@ -147,9 +153,17 @@ def test_index_served(srv):
     assert code == 200 and "text/html" in ctype and b"<html" in body
 
 
-def test_setup_page_served(srv):
-    code, body, ctype = get_raw(srv, "/setup")
-    assert code == 200 and "text/html" in ctype and b"<html" in body
+def test_setup_page_served_on_the_hotspot_address():
+    s, t = _start(StubFireplace(), hotspot_address="127.0.0.1")
+    try:
+        code, body, ctype = get_raw(s, "/setup")
+        assert code == 200 and "text/html" in ctype and b"<html" in body
+    finally:
+        _stop(s, t)
+
+
+def test_setup_page_is_404_off_the_hotspot(srv):
+    assert get_raw(srv, "/setup")[0] == 404
 
 
 def test_unknown_path_is_404(srv):
@@ -264,12 +278,12 @@ def test_extra_routes_receive_body_and_bypass_fireplace():
         return 202, {"ok": True}
 
     stub = StubFireplace()
-    s, t = _start(stub, extra={("POST", "/api/wifi"): handler, ("GET", "/api/wifi"): handler})
+    s, t = _start(stub, extra={("POST", "/api/x"): handler, ("GET", "/api/x"): handler})
     try:
-        assert post(s, "/api/wifi", {"ssid": "x"}) == (202, {"ok": True})
-        assert post(s, "/api/wifi", None)[0] == 202
-        assert get(s, "/api/wifi") == (202, {"ok": True})
-        assert post_raw(s, "/api/wifi", b"{bad")[0] == 400
+        assert post(s, "/api/x", {"ssid": "x"}) == (202, {"ok": True})
+        assert post(s, "/api/x", None)[0] == 202
+        assert get(s, "/api/x") == (202, {"ok": True})
+        assert post_raw(s, "/api/x", b"{bad")[0] == 400
         assert seen == [{"ssid": "x"}, None, None]
         assert stub.calls == []
     finally:
@@ -304,3 +318,89 @@ def test_server_exposes_and_accepts_the_fireplace_lock():
         assert other.fireplace_lock is not own
     finally:
         other.server_close()
+
+
+# ---- Host / Content-Type / hotspot-only guards ---------------------------
+
+def raw_request(port, method, path, host=None, headers=(), body=b""):
+    """Like http.client but with full control of the Host header (None = omit it)."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.putrequest(method, path, skip_host=True)
+        if host is not None:
+            conn.putheader("Host", host)
+        for k, v in headers:
+            conn.putheader(k, v)
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body)
+        r = conn.getresponse()
+        data = r.read()
+        return r.status, json.loads(data) if data.startswith(b"{") else data
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("host", ["evil.example", "evil.example:80", "pireplace.local.evil.example", "", None])
+def test_foreign_or_missing_host_is_403_on_get_and_post(srv, host):
+    assert raw_request(srv.port, "GET", "/api/status", host) == (403, {"error": "forbidden host"})
+    assert raw_request(srv.port, "GET", "/", host)[0] == 403
+    code, _ = raw_request(srv.port, "POST", "/api/music", host,
+                          headers=[("Content-Type", "application/json")], body=b'{"action": "pause"}')
+    assert code == 403 and srv.stub.calls == []
+
+
+@pytest.mark.parametrize("host", ["pireplace.local", "PIREPLACE.LOCAL:80", "pireplace", "localhost:8080",
+                                  "pireplace.local."])
+def test_allowed_hosts_accepted_case_insensitive_with_port(srv, host):
+    assert raw_request(srv.port, "GET", "/api/status", host)[0] == 200
+
+
+def test_host_equal_to_local_ip_is_accepted_even_if_not_listed():
+    s, t = _start(StubFireplace(), allowed_hosts=("pireplace.local",))
+    try:
+        assert raw_request(s.port, "GET", "/api/status", f"127.0.0.1:{s.port}")[0] == 200
+        assert raw_request(s.port, "GET", "/api/status", "localhost")[0] == 403
+    finally:
+        _stop(s, t)
+
+
+@pytest.mark.parametrize("ctype", ["text/plain", "application/x-www-form-urlencoded",
+                                   "multipart/form-data; boundary=x", "application/jsonp", None])
+def test_post_without_json_content_type_is_415(srv, ctype):
+    headers = {} if ctype is None else {"Content-Type": ctype}
+    code, data, _ = request(srv, "POST", "/api/music", b'{"action": "pause"}', headers=headers)
+    assert code == 415 and json.loads(data) == {"error": "content-type must be application/json"}
+    assert srv.stub.calls == []
+
+
+def test_json_content_type_with_charset_is_accepted(srv):
+    code, _, _ = request(srv, "POST", "/api/music", b'{"action": "pause"}',
+                         headers={"Content-Type": "Application/JSON; charset=utf-8"})
+    assert code == 200 and srv.stub.calls == [("pause",)]
+
+
+def test_hotspot_only_routes_are_404_unless_on_the_hotspot_address():
+    def handler(_body):
+        return 200, {"ok": True}
+
+    extra = {("GET", "/api/wifi/networks"): handler, ("POST", "/api/wifi/connect"): handler}
+    off, t1 = _start(StubFireplace(), extra=extra, hotspot_address="10.42.0.1")
+    on, t2 = _start(StubFireplace(), extra=extra, hotspot_address="127.0.0.1")
+    try:
+        assert get_raw(off, "/api/wifi/networks")[0] == 404
+        assert post(off, "/api/wifi/connect", {})[0] == 404
+        assert get_raw(off, "/setup")[0] == 404
+        assert get(on, "/api/wifi/networks") == (200, {"ok": True})
+        assert post(on, "/api/wifi/connect", {}) == (200, {"ok": True})
+        assert get_raw(on, "/setup")[0] == 200
+        assert get(on, "/api/status")[0] == 200  # normal routes still work there
+    finally:
+        _stop(off, t1)
+        _stop(on, t2)
+
+
+def test_index_page_posts_send_json_content_type():
+    from pireplace.web import INDEX_HTML
+
+    html = INDEX_HTML.read_text()
+    assert 'act("POST", "/api/rescan")' not in html  # every POST carries a JSON body

@@ -110,9 +110,10 @@
 
   function api(method, path, body) {
     var opts = { method: method, headers: {} };
-    if (body !== undefined) {
+    if (method === "POST") {
+      // The server only accepts JSON POSTs (blocks cross-site form posts).
       opts.headers["Content-Type"] = "application/json";
-      opts.body = JSON.stringify(body);
+      opts.body = JSON.stringify(body === undefined ? {} : body);
     }
     return fetch(path, opts).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (data) {
@@ -211,7 +212,7 @@
     var muted = !!(current && current.log && current.log.muted);
     act("POST", "/api/log", { muted: !muted });
   });
-  $("rescan").addEventListener("click", function () { act("POST", "/api/rescan"); });
+  $("rescan").addEventListener("click", function () { act("POST", "/api/rescan", {}); });
   wireSlider("music-vol", "music");
   wireSlider("log-vol", "log");
 

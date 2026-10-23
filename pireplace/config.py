@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+DEFAULT_ALLOWED_HOSTS = ("pireplace.local", "pireplace", "localhost", "127.0.0.1")
+DEFAULT_HOTSPOT_ADDRESS = "10.42.0.1"  # NetworkManager's address for a shared (hotspot) connection
+
+
 class ConfigError(Exception):
     """Raised when the config file is unreadable or contains invalid values."""
 
@@ -28,10 +32,13 @@ class Config:
     hotspot_password: str
     hotspot_after_s: int
     hotspot_retry_s: int
+    # Defaults here too so code that builds a Config by hand need not repeat them.
+    hotspot_address: str = DEFAULT_HOTSPOT_ADDRESS
+    allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS
 
 
 # field -> (section, key, kind, default, min, max)
-# kind is one of: path, bool, str, opt_str, int
+# kind is one of: path, bool, str, opt_str, int, hosts
 _SPEC = {
     "video_dir": ("media", "video_dir", "path", "/srv/pireplace/videos", None, None),
     "music_dir": ("media", "music_dir", "path", "/srv/pireplace/music", None, None),
@@ -44,10 +51,12 @@ _SPEC = {
     "log_volume": ("playback", "log_volume", "int", 40, 0, 100),
     "host": ("web", "host", "str", "0.0.0.0", None, None),
     "port": ("web", "port", "int", 80, 1, 65535),
+    "allowed_hosts": ("web", "allowed_hosts", "hosts", list(DEFAULT_ALLOWED_HOSTS), None, None),
     "hotspot_ssid": ("wifi", "hotspot_ssid", "str", "pireplace-setup", None, None),
     "hotspot_password": ("wifi", "hotspot_password", "str", "", None, None),
     "hotspot_after_s": ("wifi", "hotspot_after_s", "int", 300, 0, None),
     "hotspot_retry_s": ("wifi", "hotspot_retry_s", "int", 300, 0, None),
+    "hotspot_address": ("wifi", "hotspot_address", "str", DEFAULT_HOTSPOT_ADDRESS, None, None),
 }
 
 
@@ -62,6 +71,10 @@ def _coerce(label: str, value: object, kind: str, lo: int | None, hi: int | None
         if (lo is not None and value < lo) or (hi is not None and value > hi):
             raise ConfigError(f"{label}: {value} is out of range (min {lo}, max {hi})")
         return value
+    if kind == "hosts":
+        if not isinstance(value, list) or not all(isinstance(h, str) and h for h in value):
+            raise ConfigError(f"{label}: expected a list of host names, got {value!r}")
+        return tuple(h.lower() for h in value)
     if not isinstance(value, str):
         raise ConfigError(f"{label}: expected a string, got {value!r}")
     if kind == "path":

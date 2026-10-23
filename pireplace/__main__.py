@@ -84,7 +84,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     )
     try:
         extra = setup_routes(Nmcli(run_command), scan_cache_path(config))
-        server = make_server(fireplace, config.host, config.port, extra=extra)
+        server = make_server(
+            fireplace,
+            config.host,
+            config.port,
+            extra=extra,
+            allowed_hosts=config.allowed_hosts,
+            hotspot_address=config.hotspot_address,
+        )
     except OSError as e:
         print(f"pireplace: cannot listen on {config.host}:{config.port}: {e}", file=sys.stderr)
         return 1

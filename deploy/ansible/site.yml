@@ -33,6 +33,13 @@
     pireplace_home: /home/pireplace
     pireplace_hostname: pireplace
     pireplace_hotspot_ssid: pireplace-setup
+    # NetworkManager's default address for a shared (hotspot) connection.
+    pireplace_hotspot_address: 10.42.0.1
+    pireplace_allowed_hosts:
+      - "{{ pireplace_hostname }}.local"
+      - "{{ pireplace_hostname }}"
+      - localhost
+      - 127.0.0.1
     pireplace_default_mood: classic-swing
     pireplace_music_volume: 60
     pireplace_log_volume: 40

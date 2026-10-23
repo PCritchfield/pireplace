@@ -45,3 +45,28 @@ def test_absolute_paths_are_untouched(tmp_path):
     p = tmp_path / "dev" / "c.toml"
     p.write_text('[media]\nvideo_dir = "/srv/x"\n')
     assert load_config(p).video_dir == Path("/srv/x")
+
+
+def test_web_and_hotspot_address_defaults(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text("")
+    c = load_config(p)
+    assert c.hotspot_address == "10.42.0.1"
+    assert c.allowed_hosts == ("pireplace.local", "pireplace", "localhost", "127.0.0.1")
+
+
+def test_allowed_hosts_override_is_lowercased(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('[web]\nallowed_hosts = ["Fire.Local", "192.168.1.5"]\n[wifi]\nhotspot_address = "10.0.0.1"\n')
+    c = load_config(p)
+    assert c.allowed_hosts == ("fire.local", "192.168.1.5") and c.hotspot_address == "10.0.0.1"
+
+
+@pytest.mark.parametrize("body", ['[web]\nallowed_hosts = "pireplace.local"\n',
+                                  '[web]\nallowed_hosts = ["ok", 3]\n',
+                                  '[wifi]\nhotspot_address = 10\n'])
+def test_invalid_host_settings_raise(tmp_path, body):
+    p = tmp_path / "c.toml"
+    p.write_text(body)
+    with pytest.raises(ConfigError):
+        load_config(p)

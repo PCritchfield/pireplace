@@ -81,3 +81,19 @@ def test_reconcile_default_sleep_waits_on_stop_event():
     stop.set()
     reconcile_forever(fp, stop, threading.Lock())
     assert fp.reconcile.call_count == 1
+
+
+def test_serve_passes_host_and_hotspot_settings_to_the_server(tmp_path, monkeypatch):
+    import pireplace.__main__ as m
+
+    seen = {}
+
+    def fake_make_server(*args, **kw):
+        seen.update(kw)
+        raise OSError("stop here")
+
+    monkeypatch.setattr(m, "make_server", fake_make_server)
+    p = tmp_path / "c.toml"
+    p.write_text('[web]\nallowed_hosts = ["fire.local"]\n[wifi]\nhotspot_address = "10.1.1.1"\n')
+    assert main(["serve", "--config", str(p)]) == 1
+    assert seen["allowed_hosts"] == ("fire.local",) and seen["hotspot_address"] == "10.1.1.1"

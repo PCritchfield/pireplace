@@ -13,3 +13,5 @@ file = ".dev/state.json"
 [web]
 host = "127.0.0.1"
 port = 8080
+# The Wi-Fi setup page only answers on the hotspot address ([wifi] hotspot_address,
+# default 10.42.0.1), so dev mode can never reconfigure this laptop's Wi-Fi.

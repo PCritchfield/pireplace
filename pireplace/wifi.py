@@ -326,6 +326,14 @@ def setup_routes(nmcli, scan_cache: Path, settle_s: float = 1.5,
 
     def api_connect(body) -> tuple[int, dict]:
         ssid, password = _validate_credentials(body)
+        try:
+            hotspot_up = nmcli.hotspot_active()
+        except WifiError as e:
+            log.warning("cannot check the hotspot: %s", e)
+            return 503, {"error": "cannot check the Wi-Fi state; try again"}
+        if not hotspot_up:
+            # Only a phone on the setup hotspot may change the Wi-Fi.
+            return 409, {"error": "the setup hotspot is not active"}
         if not in_flight.acquire(blocking=False):
             return 409, {"error": "a connection attempt is already in progress"}
         try:

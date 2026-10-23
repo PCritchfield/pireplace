@@ -158,9 +158,10 @@ class Srv:
 
 
 def call(srv, method, path, body=None):
+    headers = {"Content-Type": "application/json"} if method == "POST" else {}
     conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
     try:
-        conn.request(method, path, body=body)
+        conn.request(method, path, body=body, headers=headers)
         r = conn.getresponse()
         data = r.read()
         return r.status, data, r.getheader("Content-Type") or ""
@@ -215,7 +216,8 @@ def fake_nm():
 @pytest.fixture
 def setup_srv(tmp_path, fake_nm):
     cache = tmp_path / "wifi-scan.json"
-    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(fake_nm, cache, settle_s=0))
+    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(fake_nm, cache, settle_s=0),
+                        hotspot_address="127.0.0.1")  # test servers bind 127.0.0.1
     t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     t.start()
     s = Srv(httpd)
@@ -457,12 +459,47 @@ def test_failed_stop_hotspot_does_not_abort_connect(setup_srv, fake_nm, caplog):
     assert fake_nm.calls == [("stop_hotspot",), ("connect", "Home", "12345678")]
 
 
-def test_inactive_hotspot_is_not_stopped_but_connect_runs(setup_srv, fake_nm):
+def test_connect_is_409_when_the_hotspot_is_not_active(setup_srv, fake_nm):
     fake_nm.hotspot = False
     body = json.dumps({"ssid": "Home", "password": "12345678"}).encode()
-    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 202
-    assert fake_nm.done.wait(5)
+    code, data = post_raw(setup_srv, "/api/wifi/connect", body)
+    assert code == 409 and "hotspot" in data["error"]
+    assert not fake_nm.done.wait(0.2) and fake_nm.calls == []
+
+
+def test_connect_is_503_when_hotspot_state_is_unknown(setup_srv, fake_nm):
+    def boom():
+        raise WifiError("nmcli connection show failed (exit 8)")
+
+    fake_nm.hotspot_active = boom
+    body = json.dumps({"ssid": "Home", "password": "12345678"}).encode()
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 503
+    assert fake_nm.calls == []
+
+
+def test_hotspot_gone_by_connect_time_is_not_stopped_but_connect_runs(tmp_path, fake_nm):
+    # The watcher may drop the hotspot between the request and the background connect.
+    routes = setup_routes(fake_nm, tmp_path / "s.json", settle_s=0,
+                          sleep=lambda s: setattr(fake_nm, "hotspot", False))
+    code, _ = routes[("POST", "/api/wifi/connect")]({"ssid": "Home", "password": "12345678"})
+    assert code == 202 and fake_nm.done.wait(5)
     assert fake_nm.calls == [("connect", "Home", "12345678")]
+
+
+def test_wifi_routes_are_404_off_the_hotspot_address(tmp_path, fake_nm):
+    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(fake_nm, tmp_path / "s.json", settle_s=0),
+                        hotspot_address="10.42.0.1")
+    t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    t.start()
+    try:
+        srv = Srv(httpd)
+        body = json.dumps({"ssid": "Home", "password": "12345678"}).encode()
+        assert call(srv, "GET", "/setup")[0] == 404
+        assert call(srv, "GET", "/api/wifi/networks")[0] == 404
+        assert call(srv, "POST", "/api/wifi/connect", body)[0] == 404
+        assert fake_nm.calls == []
+    finally:
+        httpd.shutdown(); httpd.server_close(); t.join(timeout=5)
 
 
 def test_connect_waits_settle_time_before_touching_hotspot(tmp_path, fake_nm):
@@ -485,7 +522,8 @@ def test_real_error_path_never_leaks_password_to_logs_or_responses(tmp_path, cap
             return "pireplace-hotspot:802-11-wireless:wlan0\n"
         raise subprocess.CalledProcessError(10, ["nmcli", "x", SECRET], stderr=f"Error {SECRET}")
     cache = tmp_path / "s.json"
-    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(Nmcli(run), cache, settle_s=0))
+    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(Nmcli(run), cache, settle_s=0),
+                        hotspot_address="127.0.0.1")
     t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     t.start()
     try:

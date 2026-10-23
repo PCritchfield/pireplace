@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
+from pireplace.config import DEFAULT_ALLOWED_HOSTS
 from pireplace.controller import Fireplace, UnknownMood
 from pireplace.mpv import MpvUnavailable
 
@@ -20,6 +21,10 @@ MAX_BODY = 4096
 _DRAIN_LIMIT = 1 << 20  # read and discard at most this much of an oversize body
 INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 SETUP_HTML = Path(__file__).parent / "static" / "setup.html"
+
+# Wi-Fi setup: only answered on the hotspot's own address (i.e. to a phone on the hotspot).
+HOTSPOT_ONLY_PATH = "/setup"
+HOTSPOT_ONLY_PREFIX = "/api/wifi/"
 
 MUSIC_ACTIONS = ("play", "pause", "next")
 VOLUME_TARGETS = ("music", "log")
@@ -45,19 +50,48 @@ def _int_level(value: object) -> int:
     return value
 
 
+def host_name(header: str | None) -> str | None:
+    """The host part of a Host header: port and trailing dot dropped, lowercased."""
+    if not header:
+        return None
+    host = header.strip().lower()
+    if host.startswith("["):  # [v6]:port
+        end = host.find("]")
+        return host[1:end] if end > 0 else None
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".") or None
+
+
+def _is_hotspot_only(path: str) -> bool:
+    return path == HOTSPOT_ONLY_PATH or path.startswith(HOTSPOT_ONLY_PREFIX)
+
+
 def make_server(
     fireplace: Fireplace,
     host: str,
     port: int,
     extra: dict[tuple[str, str], Handler] | None = None,
     lock: threading.Lock | None = None,
+    *,
+    allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS,
+    hotspot_address: str | None = None,
 ) -> ThreadingHTTPServer:
     """Build (but do not start) the HTTP server. Use port 0 for an ephemeral port.
 
     Fireplace is not thread-safe: every call must hold `lock`. It is also exposed
     as `server.fireplace_lock` for other threads that call into the Fireplace.
+
+    Guards on every request (no auth by design, so these stop other web pages from
+    driving the box through a guest's browser):
+    - the Host header must be in `allowed_hosts` or be the address the request came in
+      on (DNS rebinding), else 403;
+    - a POST must be Content-Type: application/json (cross-site form posts), else 415;
+    - `/setup` and `/api/wifi/...` exist only for requests that arrived on
+      `hotspot_address` (None: never), else 404.
     """
     lock = lock or threading.Lock()
+    allowed = frozenset(h.lower() for h in allowed_hosts)
     extra = dict(extra or {})
 
     def with_status(fn: Callable, *args) -> tuple[int, dict]:
@@ -144,9 +178,28 @@ def make_server(
                 raise _BodyTooLarge
             return self.rfile.read(length)
 
+        def _local_address(self) -> str:
+            return self.connection.getsockname()[0]
+
+        def _host_allowed(self) -> bool:
+            name = host_name(self.headers.get("Host"))
+            return name is not None and (name in allowed or name == self._local_address())
+
+        def _is_json(self) -> bool:
+            ctype = self.headers.get("Content-Type") or ""
+            return ctype.split(";", 1)[0].strip().lower() == "application/json"
+
         def _dispatch(self, method: str) -> None:
             path = self.path.split("?", 1)[0]
             try:
+                if not self._host_allowed():
+                    self._send_json(403, {"error": "forbidden host"})
+                    return
+                if _is_hotspot_only(path) and (
+                    hotspot_address is None or self._local_address() != hotspot_address
+                ):
+                    self._send_json(404, {"error": "not found"})
+                    return
                 if method == "GET" and path in ("/", "/index.html"):
                     self._send(200, INDEX_HTML.read_bytes(), "text/html; charset=utf-8")
                     return
@@ -156,6 +209,9 @@ def make_server(
                 handler = routes.get((method, path))
                 if handler is None:
                     self._send_json(404, {"error": "not found"})
+                    return
+                if method == "POST" and not self._is_json():
+                    self._send_json(415, {"error": "content-type must be application/json"})
                     return
                 raw = self._read_body() if method == "POST" else b""
                 body = None

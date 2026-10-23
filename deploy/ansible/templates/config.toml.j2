@@ -20,9 +20,13 @@ log_volume = {{ pireplace_log_volume | int }}
 [web]
 host = "0.0.0.0"
 port = 80
+# Host header names the page answers to (its own IP address is always accepted).
+allowed_hosts = {{ pireplace_allowed_hosts | to_json }}
 
 [wifi]
 hotspot_ssid = {{ pireplace_hotspot_ssid | to_json }}
 hotspot_password = {{ hotspot_password | string | to_json }}
 hotspot_after_s = 300
 hotspot_retry_s = 300
+# The setup page only answers requests made to this address (NetworkManager's hotspot).
+hotspot_address = {{ pireplace_hotspot_address | to_json }}
