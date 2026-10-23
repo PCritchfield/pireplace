@@ -19,3 +19,7 @@ __pycache__/
 *.swf
 *.vob
 *.wmv
+
+# local Ansible inventory and secrets
+deploy/ansible/inventory.ini
+secrets.yml

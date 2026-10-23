@@ -1,0 +1,8 @@
+// Let the pireplace service user manage Wi-Fi through NetworkManager without a
+// desktop session. Other users fall through to the default policy.
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 &&
+        subject.user === "pireplace") {
+        return polkit.Result.YES;
+    }
+});

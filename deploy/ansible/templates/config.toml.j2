@@ -1,0 +1,28 @@
+# Managed by Ansible (deploy/ansible/site.yml). Local edits are overwritten.
+
+[media]
+video_dir = "/srv/pireplace/videos"
+music_dir = "/srv/pireplace/music"
+
+[players]
+video_socket = "/run/pireplace/video.sock"
+music_socket = "/run/pireplace/music.sock"
+
+[state]
+file = "/var/lib/pireplace/state.json"
+
+[playback]
+start_music = {{ pireplace_start_music | bool | lower }}
+default_mood = {{ pireplace_default_mood | to_json }}
+music_volume = {{ pireplace_music_volume | int }}
+log_volume = {{ pireplace_log_volume | int }}
+
+[web]
+host = "0.0.0.0"
+port = 80
+
+[wifi]
+hotspot_ssid = {{ pireplace_hotspot_ssid | to_json }}
+hotspot_password = {{ hotspot_password | string | to_json }}
+hotspot_after_s = 300
+hotspot_retry_s = 300

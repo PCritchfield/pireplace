@@ -1,0 +1,16 @@
+[Unit]
+Description=pireplace background music player (mpv)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+# User unit of the pireplace user; needs the user's PipeWire session. See the video unit
+# for why sandboxing is limited to NoNewPrivileges.
+Type=simple
+NoNewPrivileges=yes
+ExecStart=/usr/bin/mpv --no-video --idle=yes --loop-playlist=inf --input-ipc-server=/run/pireplace/music.sock --really-quiet
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

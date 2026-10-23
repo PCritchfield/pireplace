@@ -1,0 +1,17 @@
+[Unit]
+Description=pireplace fire video player (mpv)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+# User unit of the pireplace user. Sandboxing beyond NoNewPrivileges is left out on
+# purpose: mpv needs /dev/dri and the user's PipeWire, and ProtectSystem/PrivateTmp
+# depend on user namespaces that a user manager may not have.
+Type=simple
+NoNewPrivileges=yes
+ExecStart=/usr/bin/mpv --vo=gpu --gpu-context=drm --hwdec=auto-safe --fullscreen --idle=yes --loop-playlist=inf --no-osc --osd-level=0 --no-input-default-bindings --input-ipc-server=/run/pireplace/video.sock --really-quiet
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
