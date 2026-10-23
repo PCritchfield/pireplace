@@ -72,6 +72,8 @@ def _coerce(label: str, value: object, kind: str, lo: int | None, hi: int | None
 
 
 def load_config(path: Path) -> Config:
+    """Read `path`. Relative paths in it resolve against the parent of its directory."""
+    path = Path(path)
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)
@@ -85,5 +87,8 @@ def load_config(path: Path) -> Config:
         table = data.get(section, {})
         if not isinstance(table, dict):
             raise ConfigError(f"[{section}]: expected a table")
-        values[name] = _coerce(f"{section}.{key}", table.get(key, default), kind, lo, hi)
+        value = _coerce(f"{section}.{key}", table.get(key, default), kind, lo, hi)
+        if kind == "path" and not value.is_absolute():
+            value = path.resolve().parent.parent / value
+        values[name] = value
     return Config(**values)

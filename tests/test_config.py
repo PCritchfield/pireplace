@@ -31,3 +31,17 @@ def test_invalid_values_raise(tmp_path, body):
     p.write_text(body)
     with pytest.raises(ConfigError):
         load_config(p)
+
+
+def test_relative_paths_resolve_against_repo_root(tmp_path):
+    (tmp_path / "dev").mkdir()
+    p = tmp_path / "dev" / "c.toml"
+    p.write_text('[media]\nvideo_dir = ".dev/media/videos"\n')
+    assert load_config(p).video_dir == tmp_path / ".dev/media/videos"
+
+
+def test_absolute_paths_are_untouched(tmp_path):
+    (tmp_path / "dev").mkdir()
+    p = tmp_path / "dev" / "c.toml"
+    p.write_text('[media]\nvideo_dir = "/srv/x"\n')
+    assert load_config(p).video_dir == Path("/srv/x")
