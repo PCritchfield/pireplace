@@ -69,17 +69,43 @@ ACTIVE = "Home:802-11-wireless:wlan0\nlo:loopback:lo\n"
 HOTSPOT = "pireplace-hotspot:802-11-wireless:wlan0\n"
 
 
-@pytest.mark.parametrize("out,conn,hot", [
-    ("", False, False),
-    (ACTIVE, True, False),
-    (HOTSPOT, False, True),
-    (ACTIVE + HOTSPOT, True, True),
-    ("Wired:802-3-ethernet:eth0\n", True, False),
-    ("lo:loopback:lo\n", False, False),
+@pytest.mark.parametrize("out,hot", [
+    ("", False),
+    (ACTIVE, False),
+    (HOTSPOT, True),
+    (ACTIVE + HOTSPOT, True),
 ])
-def test_connected_and_hotspot_active(out, conn, hot):
-    n = Nmcli(lambda c: out)
-    assert n.connected() is conn and n.hotspot_active() is hot
+def test_hotspot_active(out, hot):
+    assert Nmcli(lambda c: out).hotspot_active() is hot
+
+
+# `nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device` as printed by NetworkManager 1.42+
+DEV_IDLE = (
+    "eth0:ethernet:unavailable:\n"
+    "lo:loopback:connected (externally):lo\n"
+    "p2p-dev-wlan0:wifi-p2p:disconnected:\n"
+)
+DEV_WIFI = "wlan0:wifi:connected:Home Net\n"
+DEV_HOTSPOT = "wlan0:wifi:connected:pireplace-hotspot\n"
+DEV_WIRED = "eth0:ethernet:connected:Wired connection 1\n"
+
+
+@pytest.mark.parametrize("out,conn", [
+    ("", False),
+    (DEV_IDLE, False),
+    (DEV_IDLE + "wlan0:wifi:disconnected:\n", False),
+    (DEV_IDLE + DEV_WIFI, True),
+    (DEV_IDLE + DEV_HOTSPOT, False),
+    (DEV_WIRED + DEV_HOTSPOT, True),
+    ("wlan0:wifi:connecting (getting IP configuration):Home\n", False),
+    ("wlan0:wifi:connected:Caf\\: Guest\n", True),
+    ("tun0:tun:connected (externally):tun0\n", False),
+])
+def test_connected_uses_device_state(out, conn):
+    calls = []
+    n = Nmcli(lambda c: calls.append(c) or out)
+    assert n.connected() is conn
+    assert calls == [["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]]
 
 
 def test_try_known_networks_tries_profiles_until_one_works():

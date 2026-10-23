@@ -29,8 +29,8 @@ Action = Literal["none", "start_hotspot", "retry_known", "stop_hotspot"]
 
 HOTSPOT_CON = "pireplace-hotspot"
 HOTSPOT_IFACE = "wlan0"
-WIFI_TYPE = "802-11-wireless"
-ETHERNET_TYPE = "802-3-ethernet"
+WIFI_TYPE = "802-11-wireless"  # connection TYPE (nmcli connection show)
+UPLINK_DEVICE_TYPES = ("wifi", "ethernet")  # device TYPE (nmcli device)
 TICK_S = 10
 KNOWN_BUDGET_S = 30
 CONNECTING_MAX_AGE_S = 120
@@ -108,7 +108,12 @@ class Nmcli:
         return _rows(self._call(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"]), 2)
 
     def connected(self) -> bool:
-        return any(r[0] != HOTSPOT_CON and r[1] in (WIFI_TYPE, ETHERNET_TYPE) for r in self._active())
+        """A Wi-Fi or ethernet device is fully connected to something other than our hotspot."""
+        out = self._call(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"])
+        return any(
+            dev_type in UPLINK_DEVICE_TYPES and state == "connected" and con != HOTSPOT_CON
+            for _dev, dev_type, state, con, *_ in _rows(out, 4)
+        )
 
     def hotspot_active(self) -> bool:
         return any(r[0] == HOTSPOT_CON for r in self._active())
