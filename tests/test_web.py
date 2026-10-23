@@ -281,3 +281,7 @@ def test_extra_handler_exception_is_500():
         assert get(s, "/api/status")[0] == 200
     finally:
         _stop(s, t)
+
+
+def test_handler_has_socket_timeout(srv):
+    assert srv.httpd.RequestHandlerClass.timeout == 10

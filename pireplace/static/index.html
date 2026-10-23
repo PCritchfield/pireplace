@@ -172,13 +172,14 @@
   }
 
   function setSlider(id, value) {
+    if (typeof value !== "number") { return; }
     $(id).value = value;
     $(id + "-out").textContent = value;
   }
 
   function act(method, path, body) {
     return api(method, path, body).then(function (s) { showError(null); render(s); })
-      .catch(function (e) { showError(e); return refresh(); });
+      .catch(function (e) { return refresh().then(function () { showError(e); }); });
   }
 
   function refresh() {
@@ -193,9 +194,10 @@
       $(id + "-out").textContent = el.value;
       clearTimeout(timers[id]);
       timers[id] = setTimeout(function () {
+        timers[id] = null;
         var level = parseInt(el.value, 10);
         act("POST", "/api/volume", { target: target, level: level })
-          .then(function () { dragging[id] = false; });
+          .then(function () { if (!timers[id]) { dragging[id] = false; } });
       }, DEBOUNCE_MS);
     });
   }

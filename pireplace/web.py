@@ -106,6 +106,8 @@ def make_server(
     no_body = {("POST", "/api/rescan")}  # body ignored, may be empty
 
     class RequestHandler(BaseHTTPRequestHandler):
+        timeout = 10  # a client that stalls mid-request must not pin a thread forever
+
         def log_message(self, format, *args):  # silence per-request stderr logging
             log.debug("%s - %s", self.address_string(), format % args)
 
