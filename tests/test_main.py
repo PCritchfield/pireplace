@@ -30,7 +30,7 @@ def test_startup_retries_until_players_answer():
     fp = Mock()
     fp.startup.side_effect = [MpvUnavailable("a"), MpvError("b"), None]
     sleeps = []
-    startup_with_retry(fp, threading.Event(), sleep=lambda s: sleeps.append(s) or False)
+    startup_with_retry(fp, threading.Event(), threading.Lock(), sleep=lambda s: sleeps.append(s) or False)
     assert fp.startup.call_count == 3
     assert sleeps == [2, 2]
 
@@ -44,5 +44,32 @@ def test_startup_retry_stops_when_asked():
         stop.set()
         return True
 
-    startup_with_retry(fp, stop, sleep=sleep)
+    startup_with_retry(fp, stop, threading.Lock(), sleep=sleep)
     assert fp.startup.call_count == 1
+
+
+def test_startup_attempts_hold_the_lock_but_sleep_does_not():
+    lock = threading.Lock()
+    held_during = []
+    fp = Mock()
+
+    def startup():
+        held_during.append(lock.locked())
+        if len(held_during) == 1:
+            raise MpvUnavailable("down")
+
+    fp.startup.side_effect = startup
+
+    def sleep(_s):
+        held_during.append(("sleep", lock.locked()))
+        return False
+
+    startup_with_retry(fp, threading.Event(), lock, sleep=sleep)
+    assert held_during == [True, ("sleep", False), True]
+
+
+def test_startup_retries_on_oserror_and_keeps_going():
+    fp = Mock()
+    fp.startup.side_effect = [FileNotFoundError("music dir"), None]
+    startup_with_retry(fp, threading.Event(), threading.Lock(), sleep=lambda s: False)
+    assert fp.startup.call_count == 2

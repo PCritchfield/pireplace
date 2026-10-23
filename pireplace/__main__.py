@@ -26,19 +26,22 @@ DEFAULT_CONFIG = "/etc/pireplace/config.toml"
 def startup_with_retry(
     fireplace: Fireplace,
     stop: threading.Event,
+    lock: threading.Lock,
     sleep: Callable[[float], bool] | None = None,
 ) -> None:
     """Call fireplace.startup() every RETRY_S seconds until both players answer.
 
     `sleep(seconds)` returns True if asked to stop; defaults to stop.wait.
+    Each attempt holds `lock` (shared with the web server); the sleep never does.
     Failures are logged on the first attempt and then once per minute.
     """
     sleep = sleep or stop.wait
     last_logged = None
     while True:
         try:
-            fireplace.startup()
-        except (MpvUnavailable, MpvError) as e:
+            with lock:
+                fireplace.startup()
+        except (MpvUnavailable, MpvError, OSError) as e:
             now = time.monotonic()
             if last_logged is None or now - last_logged >= LOG_EVERY_S:
                 log.warning("players not ready, retrying every %ds: %s", RETRY_S, e)
@@ -78,7 +81,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     stop = threading.Event()
     starter = threading.Thread(
-        target=startup_with_retry, args=(fireplace, stop), name="startup", daemon=True
+        target=startup_with_retry, args=(fireplace, stop, server.fireplace_lock), name="startup", daemon=True
     )
     starter.start()
     log.info("serving on http://%s:%d", config.host, config.port)

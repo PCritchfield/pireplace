@@ -285,3 +285,17 @@ def test_extra_handler_exception_is_500():
 
 def test_handler_has_socket_timeout(srv):
     assert srv.httpd.RequestHandlerClass.timeout == 10
+
+
+def test_server_exposes_and_accepts_the_fireplace_lock():
+    own = threading.Lock()
+    server = make_server(object(), "127.0.0.1", 0, lock=own)
+    try:
+        assert server.fireplace_lock is own
+    finally:
+        server.server_close()
+    other = make_server(object(), "127.0.0.1", 0)
+    try:
+        assert other.fireplace_lock is not own
+    finally:
+        other.server_close()

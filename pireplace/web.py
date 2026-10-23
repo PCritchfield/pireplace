@@ -49,9 +49,14 @@ def make_server(
     host: str,
     port: int,
     extra: dict[tuple[str, str], Handler] | None = None,
+    lock: threading.Lock | None = None,
 ) -> ThreadingHTTPServer:
-    """Build (but do not start) the HTTP server. Use port 0 for an ephemeral port."""
-    lock = threading.Lock()  # Fireplace is not thread-safe: one call at a time
+    """Build (but do not start) the HTTP server. Use port 0 for an ephemeral port.
+
+    Fireplace is not thread-safe: every call must hold `lock`. It is also exposed
+    as `server.fireplace_lock` for other threads that call into the Fireplace.
+    """
+    lock = lock or threading.Lock()
     extra = dict(extra or {})
 
     def with_status(fn: Callable, *args) -> tuple[int, dict]:
@@ -177,4 +182,5 @@ def make_server(
 
     server = ThreadingHTTPServer((host, port), RequestHandler)
     server.daemon_threads = True
+    server.fireplace_lock = lock
     return server
