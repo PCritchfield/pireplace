@@ -81,15 +81,22 @@ class Nmcli:
     def __init__(self, run: Runner, clock: Callable[[], float] = time.monotonic):
         self._run = run
         self._clock = clock
+        self._secrets: set[str] = set()  # passwords seen so far; redacted from stderr
 
     def _call(self, cmd: list[str], secret: str = "") -> str:
+        if secret:
+            self._secrets.add(secret)
         try:
             return self._run(cmd)
         except subprocess.CalledProcessError as e:
-            detail = (e.stderr or "").strip().splitlines()
+            # stderr is only surfaced for password-bearing calls (redacted); other commands
+            # report just the exit code, so a password can never ride along in their stderr.
+            detail = (e.stderr or "").strip().splitlines() if secret else []
             msg = f"nmcli {' '.join(cmd[1:3])} failed (exit {e.returncode})"
             if detail:
-                first = detail[0].replace(secret, "***") if secret else detail[0]
+                first = detail[0]
+                for sec in self._secrets:
+                    first = first.replace(sec, "***")
                 msg += f": {first}"
             raise WifiError(msg) from None
         except subprocess.TimeoutExpired:
@@ -282,7 +289,8 @@ def _validate_credentials(body: object) -> tuple[str, str]:
     return ssid, password
 
 
-def setup_routes(nmcli, scan_cache: Path) -> dict[tuple[str, str], Handler]:
+def setup_routes(nmcli, scan_cache: Path, settle_s: float = 1.5,
+                 sleep: Callable[[float], object] = time.sleep) -> dict[tuple[str, str], Handler]:
     """Handlers for make_server(extra=...). `GET /setup` itself is a static page in web.py."""
     scan_cache = Path(scan_cache)
     marker = _connecting_marker(scan_cache)
@@ -291,9 +299,19 @@ def setup_routes(nmcli, scan_cache: Path) -> dict[tuple[str, str], Handler]:
     def api_networks(_body) -> tuple[int, dict]:
         return 200, {"networks": read_scan_cache(scan_cache)}
 
+    def stop_hotspot_if_up() -> None:
+        # Best effort: `connection down` fails when the hotspot is not active (e.g. we are
+        # on ethernet, or the watcher just stopped it). That must not abort the connect.
+        try:
+            if nmcli.hotspot_active():
+                nmcli.stop_hotspot()
+        except Exception as e:
+            log.warning("could not stop hotspot: %s", e if isinstance(e, WifiError) else type(e).__name__)
+
     def do_connect(ssid: str, password: str) -> None:
         try:
-            nmcli.stop_hotspot()
+            sleep(settle_s)  # let the 202 reach a phone that is connected over the hotspot
+            stop_hotspot_if_up()
             nmcli.connect(ssid, password)
             log.info("connected to %r", ssid)
         except Exception as e:

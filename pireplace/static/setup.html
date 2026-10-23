@@ -113,6 +113,10 @@
       return r.json().catch(function () { return {}; }).then(function (d) {
         if (!r.ok) { throw new Error(d.error || ("HTTP " + r.status)); }
       });
+    }).catch(function (e) {
+      // A network failure (not an HTTP error) usually means the hotspot already went down.
+      if (e instanceof TypeError) { return; }
+      throw e;
     }).then(function () {
       say("Connecting. This setup network will disappear and this page will stop responding. " +
           "Reconnect your phone to your home Wi-Fi, then open http://pireplace.local. " +

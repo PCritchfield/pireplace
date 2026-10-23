@@ -188,9 +188,16 @@ class FakeNm:
         self.release = threading.Event()
         self.release.set()
         self.connect_error = None
+        self.stop_error = None
+        self.hotspot = True
+
+    def hotspot_active(self):
+        return self.hotspot
 
     def stop_hotspot(self):
         self.calls.append(("stop_hotspot",))
+        if self.stop_error:
+            raise self.stop_error
 
     def connect(self, ssid, password):
         self.release.wait(5)
@@ -208,7 +215,7 @@ def fake_nm():
 @pytest.fixture
 def setup_srv(tmp_path, fake_nm):
     cache = tmp_path / "wifi-scan.json"
-    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(fake_nm, cache))
+    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(fake_nm, cache, settle_s=0))
     t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     t.start()
     s = Srv(httpd)
@@ -439,3 +446,64 @@ def test_empty_default_hotspot_password_exits_2(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text("")
     assert main(["wifi-watch", "--config", str(p)]) == 2
+
+
+def test_failed_stop_hotspot_does_not_abort_connect(setup_srv, fake_nm, caplog):
+    fake_nm.stop_error = WifiError("nmcli connection down failed (exit 10)")
+    caplog.set_level(logging.DEBUG)
+    body = json.dumps({"ssid": "Home", "password": "12345678"}).encode()
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 202
+    assert fake_nm.done.wait(5)
+    assert fake_nm.calls == [("stop_hotspot",), ("connect", "Home", "12345678")]
+
+
+def test_inactive_hotspot_is_not_stopped_but_connect_runs(setup_srv, fake_nm):
+    fake_nm.hotspot = False
+    body = json.dumps({"ssid": "Home", "password": "12345678"}).encode()
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 202
+    assert fake_nm.done.wait(5)
+    assert fake_nm.calls == [("connect", "Home", "12345678")]
+
+
+def test_connect_waits_settle_time_before_touching_hotspot(tmp_path, fake_nm):
+    slept = []
+    routes = setup_routes(fake_nm, tmp_path / "s.json", settle_s=1.5,
+                          sleep=lambda s: slept.append((s, list(fake_nm.calls))))
+    code, _ = routes[("POST", "/api/wifi/connect")]({"ssid": "Home", "password": "12345678"})
+    assert code == 202 and fake_nm.done.wait(5)
+    assert slept == [(1.5, [])]  # slept before any nmcli call
+
+
+def test_real_error_path_never_leaks_password_to_logs_or_responses(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    done = threading.Event()
+
+    def run(cmd):
+        if "connect" in cmd:
+            done.set()
+        if cmd[1:3] == ["-t", "-f"]:
+            return "pireplace-hotspot:802-11-wireless:wlan0\n"
+        raise subprocess.CalledProcessError(10, ["nmcli", "x", SECRET], stderr=f"Error {SECRET}")
+    cache = tmp_path / "s.json"
+    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(Nmcli(run), cache, settle_s=0))
+    t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    t.start()
+    try:
+        srv = Srv(httpd)
+        body = json.dumps({"ssid": "Home", "password": SECRET}).encode()
+        code, data, _ = call(srv, "POST", "/api/wifi/connect", body)
+        assert code == 202 and SECRET not in data.decode()
+        assert done.wait(5) and wait_for(lambda: "connecting to" in caplog.text)
+    finally:
+        httpd.shutdown(); httpd.server_close(); t.join(timeout=5)
+    assert SECRET not in caplog.text
+
+
+def test_non_wifi_error_in_connect_logs_only_type_name(setup_srv, fake_nm, caplog):
+    caplog.set_level(logging.DEBUG)
+    fake_nm.connect_error = subprocess.CalledProcessError(10, ["nmcli", "x", SECRET + "xx"])
+    body = json.dumps({"ssid": "Home", "password": SECRET + "xx"}).encode()
+    code, data, _ = call(setup_srv, "POST", "/api/wifi/connect", body)
+    assert code == 202 and SECRET not in data.decode()
+    assert fake_nm.done.wait(5) and wait_for(lambda: "CalledProcessError" in caplog.text)
+    assert SECRET not in caplog.text
