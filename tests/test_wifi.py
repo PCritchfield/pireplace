@@ -1,0 +1,441 @@
+import http.client
+import json
+import logging
+import subprocess
+import threading
+
+import pytest
+
+from pireplace.__main__ import main
+from pireplace.config import Config
+from pireplace.web import make_server
+from pireplace.wifi import Nmcli, WifiError, decide, run_command, setup_routes, watch
+
+SECRET = "hunter2-secret"
+
+
+@pytest.mark.parametrize("args,expected", [
+    (dict(now=100, last_connected=0, hotspot_since=None, connected=True), "none"),
+    (dict(now=299, last_connected=0, hotspot_since=None, connected=False), "none"),
+    (dict(now=300, last_connected=0, hotspot_since=None, connected=False), "start_hotspot"),
+    (dict(now=500, last_connected=0, hotspot_since=400, connected=False), "none"),
+    (dict(now=700, last_connected=0, hotspot_since=400, connected=False), "retry_known"),
+    (dict(now=700, last_connected=0, hotspot_since=400, connected=True), "stop_hotspot"),
+])
+def test_decide(args, expected):
+    assert decide(**args, after_s=300, retry_s=300) == expected
+
+
+def test_router_reboot_under_grace_never_starts_hotspot():
+    assert decide(now=1000 + 120, last_connected=1000, hotspot_since=None,
+                  connected=False, after_s=300, retry_s=300) == "none"
+
+
+def test_scan_parses_and_dedupes():
+    out = "HomeNet:80\n:60\nHomeNet:40\nCafé \\: Guest:70\n"
+    n = Nmcli(lambda cmd: out)
+    assert n.scan() == ["HomeNet", "Café : Guest"]
+
+
+def test_scan_orders_strongest_first():
+    n = Nmcli(lambda cmd: "Weak:20\nStrong:90\nMid:50\n")
+    assert n.scan() == ["Strong", "Mid", "Weak"]
+
+
+def test_connect_passes_args_as_list_not_shell():
+    calls = []
+    Nmcli(lambda c: calls.append(c) or "").connect("My Net; rm -rf /", "pa ss")
+    assert calls[-1][:4] == ["nmcli", "device", "wifi", "connect"]
+    assert "My Net; rm -rf /" in calls[-1] and "pa ss" in calls[-1]
+
+
+def test_connect_open_network_omits_password():
+    calls = []
+    Nmcli(lambda c: calls.append(c) or "").connect("Cafe", "")
+    assert "password" not in calls[-1]
+
+
+def test_start_and_stop_hotspot_commands():
+    calls = []
+    n = Nmcli(lambda c: calls.append(c) or "")
+    n.start_hotspot("pireplace-setup", "12345678")
+    n.stop_hotspot()
+    assert calls[0] == ["nmcli", "device", "wifi", "hotspot", "ifname", "wlan0", "con-name",
+                        "pireplace-hotspot", "ssid", "pireplace-setup", "password", "12345678"]
+    assert calls[1] == ["nmcli", "connection", "down", "pireplace-hotspot"]
+
+
+ACTIVE = "Home:802-11-wireless:wlan0\nlo:loopback:lo\n"
+HOTSPOT = "pireplace-hotspot:802-11-wireless:wlan0\n"
+
+
+@pytest.mark.parametrize("out,conn,hot", [
+    ("", False, False),
+    (ACTIVE, True, False),
+    (HOTSPOT, False, True),
+    (ACTIVE + HOTSPOT, True, True),
+    ("Wired:802-3-ethernet:eth0\n", True, False),
+    ("lo:loopback:lo\n", False, False),
+])
+def test_connected_and_hotspot_active(out, conn, hot):
+    n = Nmcli(lambda c: out)
+    assert n.connected() is conn and n.hotspot_active() is hot
+
+
+def test_try_known_networks_tries_profiles_until_one_works():
+    calls = []
+
+    def run(cmd):
+        calls.append(cmd)
+        if "up" in cmd:
+            if cmd[-1] == "Home":
+                raise subprocess.CalledProcessError(4, cmd)
+            return ""
+        return "Home:802-11-wireless\nOld:802-11-wireless\npireplace-hotspot:802-11-wireless\nWired:802-3-ethernet\n"
+    assert Nmcli(run).try_known_networks() is True
+    ups = [c for c in calls if "up" in c]
+    assert [c[-1] for c in ups] == ["Home", "Old"]  # hotspot and ethernet profiles skipped
+    assert all(c[:3] == ["nmcli", "connection", "up"] and c[3] == "id" for c in ups)
+
+
+def test_try_known_networks_false_when_all_fail():
+    def run(cmd):
+        if "up" in cmd:
+            raise subprocess.CalledProcessError(4, cmd)
+        return "Home:802-11-wireless\n"
+    assert Nmcli(run).try_known_networks() is False
+
+
+def test_try_known_networks_respects_time_budget():
+    now = [0.0]
+    ups = []
+
+    def run(cmd):
+        if "up" in cmd:
+            ups.append(cmd[-1])
+            now[0] += 20
+            raise subprocess.CalledProcessError(4, cmd)
+        return "A:802-11-wireless\nB:802-11-wireless\nC:802-11-wireless\n"
+    assert Nmcli(run, clock=lambda: now[0]).try_known_networks() is False
+    assert ups == ["A", "B"]  # third attempt would start after the 30 s budget
+
+
+def test_failed_connect_error_never_contains_password():
+    def run(cmd):
+        raise subprocess.CalledProcessError(4, cmd, stderr=f"bad {SECRET}")
+    with pytest.raises(WifiError) as ei:
+        Nmcli(run).connect("Home", SECRET)
+    assert SECRET not in str(ei.value) and SECRET not in repr(ei.value)
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__
+
+
+def test_timeout_is_wrapped_without_password():
+    def run(cmd):
+        raise subprocess.TimeoutExpired(cmd, 30)
+    with pytest.raises(WifiError) as ei:
+        Nmcli(run).start_hotspot("x", SECRET)
+    assert SECRET not in str(ei.value)
+
+
+def test_run_command_uses_argv_without_shell(monkeypatch):
+    seen = {}
+
+    def fake(cmd, **kw):
+        seen.update(cmd=cmd, **kw)
+        return subprocess.CompletedProcess(cmd, 0, stdout="out")
+    monkeypatch.setattr(subprocess, "run", fake)
+    assert run_command(["nmcli", "x"]) == "out"
+    assert seen["cmd"] == ["nmcli", "x"] and not seen.get("shell")
+    assert seen["check"] is True and seen["timeout"] == 30 and seen["capture_output"] and seen["text"]
+
+
+# ---- HTTP routes -------------------------------------------------------
+
+class Srv:
+    def __init__(self, httpd):
+        self.httpd = httpd
+        self.port = httpd.server_address[1]
+
+
+def call(srv, method, path, body=None):
+    conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
+    try:
+        conn.request(method, path, body=body)
+        r = conn.getresponse()
+        data = r.read()
+        return r.status, data, r.getheader("Content-Type") or ""
+    finally:
+        conn.close()
+
+
+def post_raw(srv, path, body):
+    code, data, _ = call(srv, "POST", path, body)
+    return code, json.loads(data)
+
+
+def wait_for(cond):
+    for _ in range(250):
+        if cond():
+            return True
+        threading.Event().wait(0.02)
+    return False
+
+
+class FakeNm:
+    def __init__(self):
+        self.calls = []
+        self.done = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
+        self.connect_error = None
+
+    def stop_hotspot(self):
+        self.calls.append(("stop_hotspot",))
+
+    def connect(self, ssid, password):
+        self.release.wait(5)
+        self.calls.append(("connect", ssid, password))
+        self.done.set()
+        if self.connect_error:
+            raise self.connect_error
+
+
+@pytest.fixture
+def fake_nm():
+    return FakeNm()
+
+
+@pytest.fixture
+def setup_srv(tmp_path, fake_nm):
+    cache = tmp_path / "wifi-scan.json"
+    httpd = make_server(object(), "127.0.0.1", 0, extra=setup_routes(fake_nm, cache))
+    t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    t.start()
+    s = Srv(httpd)
+    s.cache = cache
+    yield s
+    fake_nm.release.set()
+    httpd.shutdown()
+    httpd.server_close()
+    t.join(timeout=5)
+
+
+def test_setup_page_served_as_html(setup_srv):
+    code, body, ctype = call(setup_srv, "GET", "/setup")
+    assert code == 200 and "text/html" in ctype and b"<html" in body
+
+
+def test_networks_missing_cache_is_empty(setup_srv):
+    code, body, _ = call(setup_srv, "GET", "/api/wifi/networks")
+    assert code == 200 and json.loads(body) == {"networks": []}
+
+
+def test_networks_reads_cache(setup_srv):
+    setup_srv.cache.write_text(json.dumps({"networks": ["A", "B"]}))
+    assert json.loads(call(setup_srv, "GET", "/api/wifi/networks")[1]) == {"networks": ["A", "B"]}
+
+
+@pytest.mark.parametrize("content", ["not json", "[1]", '{"networks": "x"}', '{"networks": [1, "a"]}'])
+def test_networks_corrupt_cache_is_empty(setup_srv, content):
+    setup_srv.cache.write_text(content)
+    assert json.loads(call(setup_srv, "GET", "/api/wifi/networks")[1]) == {"networks": []}
+
+
+BAD_BODIES = [
+    b"{}", b"", b'{"ssid": "", "password": "x"}', b'{"ssid": "   ", "password": "x"}',
+    b'{"ssid": 5, "password": "x"}', b'{"ssid": "Home", "password": 5}',
+    b'{"ssid": "Home"}', b'{"ssid": "Home", "password": "short"}',
+    b'{"ssid": "-h", "password": "12345678"}',
+    json.dumps({"ssid": "a" * 33, "password": "12345678"}).encode(),
+    json.dumps({"ssid": "Home", "password": "p" * 64}).encode(),
+    json.dumps({"ssid": "Ho\x00me", "password": "12345678"}).encode(),
+    json.dumps({"ssid": "Home", "password": "1234\x005678"}).encode(),
+    json.dumps({"ssid": "é" * 17, "password": "12345678"}).encode(),  # 34 bytes
+    b"[]",
+]
+
+
+@pytest.mark.parametrize("body", BAD_BODIES)
+def test_connect_route_rejects_bad_input(setup_srv, fake_nm, body):
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 400
+    assert fake_nm.calls == []
+
+
+def test_connect_returns_202_then_stops_hotspot_and_connects(setup_srv, fake_nm):
+    fake_nm.release.clear()
+    body = json.dumps({"ssid": "Home Net", "password": "correct horse"}).encode()
+    code, data = post_raw(setup_srv, "/api/wifi/connect", body)
+    assert code == 202 and "correct horse" not in json.dumps(data)
+    assert wait_for(lambda: fake_nm.calls == [("stop_hotspot",)])  # connect still pending
+    fake_nm.release.set()
+    assert fake_nm.done.wait(5)
+    assert fake_nm.calls == [("stop_hotspot",), ("connect", "Home Net", "correct horse")]
+
+
+def test_connect_open_network_allowed(setup_srv, fake_nm):
+    body = json.dumps({"ssid": "Cafe", "password": ""}).encode()
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 202
+    assert fake_nm.done.wait(5)
+    assert fake_nm.calls[-1] == ("connect", "Cafe", "")
+
+
+def test_second_connect_while_busy_is_409(setup_srv, fake_nm):
+    fake_nm.release.clear()
+    body = json.dumps({"ssid": "Home", "password": "12345678"}).encode()
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 202
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 409
+    fake_nm.release.set()
+    assert fake_nm.done.wait(5)
+
+
+def test_failed_connect_logs_without_password(setup_srv, fake_nm, caplog):
+    fake_nm.connect_error = WifiError("nmcli connect failed (exit 4)")
+    caplog.set_level(logging.DEBUG)
+    body = json.dumps({"ssid": "Home", "password": SECRET + "xx"}).encode()
+    assert post_raw(setup_srv, "/api/wifi/connect", body)[0] == 202
+    assert fake_nm.done.wait(5)
+    assert wait_for(lambda: "connect failed" in caplog.text)
+    assert SECRET not in caplog.text
+
+
+def test_connect_marks_busy_marker_during_connect(setup_srv, fake_nm):
+    marker = setup_srv.cache.with_name("wifi-connecting")
+    fake_nm.release.clear()
+    body = json.dumps({"ssid": "Home", "password": "12345678"}).encode()
+    post_raw(setup_srv, "/api/wifi/connect", body)
+    assert wait_for(marker.exists)
+    fake_nm.release.set()
+    assert fake_nm.done.wait(5)
+    assert wait_for(lambda: not marker.exists())
+
+
+# ---- watcher -----------------------------------------------------------
+
+class WatchNm:
+    def __init__(self, connected=False, hotspot=False, known_ok=False):
+        self._connected, self._hotspot, self.known_ok = connected, hotspot, known_ok
+        self.calls = []
+
+    def connected(self):
+        return self._connected
+
+    def hotspot_active(self):
+        return self._hotspot
+
+    def scan(self):
+        self.calls.append("scan")
+        return ["Home", "Other"]
+
+    def start_hotspot(self, ssid, password):
+        self.calls.append(("start_hotspot", ssid))
+        self._hotspot = True
+
+    def stop_hotspot(self):
+        self.calls.append("stop_hotspot")
+        self._hotspot = False
+
+    def try_known_networks(self):
+        self.calls.append("try_known")
+        if self.known_ok:
+            self._connected = True
+        return self.known_ok
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def make_config(tmp_path, **kw):
+    base = dict(
+        video_dir=tmp_path, music_dir=tmp_path, video_socket=tmp_path / "v", music_socket=tmp_path / "m",
+        state_file=tmp_path / "state.json", start_music=True, default_mood=None, music_volume=1,
+        log_volume=1, host="127.0.0.1", port=1, hotspot_ssid="pireplace-setup",
+        hotspot_password="12345678", hotspot_after_s=300, hotspot_retry_s=300,
+    )
+    base.update(kw)
+    return Config(**base)
+
+
+def run_watch(nm, cfg, cache, clock, iterations, busy=lambda: False):
+    watch(nm, cfg, cache, clock=clock, sleep=clock.sleep, busy=busy, iterations=iterations)
+
+
+def test_watch_disconnected_past_grace_caches_scan_then_starts_hotspot(tmp_path):
+    nm, clock, cache = WatchNm(), Clock(), tmp_path / "wifi-scan.json"
+    run_watch(nm, make_config(tmp_path), cache, clock, iterations=31)  # t = 0..300
+    assert nm.calls == ["scan", ("start_hotspot", "pireplace-setup")]
+    assert json.loads(cache.read_text()) == {"networks": ["Home", "Other"]}
+    assert "12345678" not in cache.read_text()
+
+
+def test_watch_before_grace_does_nothing(tmp_path):
+    nm, clock = WatchNm(), Clock()
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=30)  # t = 0..290
+    assert nm.calls == []
+
+
+def test_watch_connected_resets_grace(tmp_path):
+    nm, clock = WatchNm(connected=True), Clock()
+    cfg = make_config(tmp_path)
+    run_watch(nm, cfg, tmp_path / "s.json", clock, iterations=40)
+    nm._connected = False
+    run_watch(nm, cfg, tmp_path / "s.json", clock, iterations=20)
+    assert nm.calls == []
+
+
+def test_watch_stops_hotspot_when_connected(tmp_path):
+    nm, clock = WatchNm(connected=True, hotspot=True), Clock()
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=1)
+    assert nm.calls == ["stop_hotspot"]
+
+
+def test_watch_retry_known_failure_rescans_and_restarts_hotspot(tmp_path):
+    nm, clock, cache = WatchNm(), Clock(), tmp_path / "s.json"
+    cfg = make_config(tmp_path)
+    run_watch(nm, cfg, cache, clock, iterations=31)
+    nm.calls.clear()
+    run_watch(nm, cfg, cache, clock, iterations=31)  # 300 s later
+    assert nm.calls == ["stop_hotspot", "try_known", "scan", ("start_hotspot", "pireplace-setup")]
+
+
+def test_watch_retry_known_success_leaves_hotspot_down(tmp_path):
+    nm, clock, cache = WatchNm(known_ok=True), Clock(), tmp_path / "s.json"
+    cfg = make_config(tmp_path)
+    run_watch(nm, cfg, cache, clock, iterations=31)
+    nm.calls.clear()
+    run_watch(nm, cfg, cache, clock, iterations=40)
+    assert nm.calls == ["stop_hotspot", "try_known"]
+
+
+def test_watch_skips_while_connect_in_progress(tmp_path):
+    nm, clock = WatchNm(), Clock()
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=40, busy=lambda: True)
+    assert nm.calls == []
+
+
+def test_watch_survives_nmcli_errors(tmp_path, caplog):
+    class Boom(WatchNm):
+        def connected(self):
+            raise WifiError("nmcli exploded")
+    clock = Clock()
+    run_watch(Boom(), make_config(tmp_path), tmp_path / "s.json", clock, iterations=3)
+    assert "nmcli exploded" in caplog.text
+
+
+def test_short_hotspot_password_exits_2(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text('[wifi]\nhotspot_password = "short"\n')
+    assert main(["wifi-watch", "--config", str(p)]) == 2
+
+
+def test_empty_default_hotspot_password_exits_2(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text("")
+    assert main(["wifi-watch", "--config", str(p)]) == 2

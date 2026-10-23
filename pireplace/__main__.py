@@ -15,6 +15,16 @@ from pireplace.controller import Fireplace
 from pireplace.mpv import MpvClient, MpvError, MpvUnavailable
 from pireplace.state import State, StateStore
 from pireplace.web import make_server
+from pireplace.wifi import (
+    MAX_PSK,
+    MIN_PSK,
+    Nmcli,
+    connecting_in_progress,
+    run_command,
+    scan_cache_path,
+    setup_routes,
+    watch,
+)
 
 log = logging.getLogger("pireplace")
 
@@ -74,7 +84,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         MpvClient(config.music_socket),
     )
     try:
-        server = make_server(fireplace, config.host, config.port)
+        extra = setup_routes(Nmcli(run_command), scan_cache_path(config))
+        server = make_server(fireplace, config.host, config.port, extra=extra)
     except OSError as e:
         print(f"pireplace: cannot listen on {config.host}:{config.port}: {e}", file=sys.stderr)
         return 1
@@ -95,6 +106,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wifi_watch(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(Path(args.config))
+    except ConfigError as e:
+        print(f"pireplace: {e}", file=sys.stderr)
+        return 2
+    if not MIN_PSK <= len(config.hotspot_password) <= MAX_PSK:
+        print(
+            f"pireplace: [wifi] hotspot_password must be {MIN_PSK}-{MAX_PSK} characters (WPA2)",
+            file=sys.stderr,
+        )
+        return 2
+    cache = scan_cache_path(config)
+    log.info("watching Wi-Fi; hotspot %r after %ds without a connection", config.hotspot_ssid, config.hotspot_after_s)
+    try:
+        watch(Nmcli(run_command), config, cache, busy=lambda: connecting_in_progress(cache))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="pireplace")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -102,6 +134,10 @@ def main(argv: list[str]) -> int:
     serve = sub.add_parser("serve", help="run the control page and drive the players")
     serve.add_argument("--config", default=DEFAULT_CONFIG, help="path to config.toml")
     serve.set_defaults(func=cmd_serve)
+
+    wifi = sub.add_parser("wifi-watch", help="start the setup hotspot when Wi-Fi is down")
+    wifi.add_argument("--config", default=DEFAULT_CONFIG, help="path to config.toml")
+    wifi.set_defaults(func=cmd_wifi_watch)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")

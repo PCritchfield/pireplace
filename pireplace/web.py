@@ -19,6 +19,7 @@ Handler = Callable[[dict | None], tuple[int, dict]]
 MAX_BODY = 4096
 _DRAIN_LIMIT = 1 << 20  # read and discard at most this much of an oversize body
 INDEX_HTML = Path(__file__).parent / "static" / "index.html"
+SETUP_HTML = Path(__file__).parent / "static" / "setup.html"
 
 MUSIC_ACTIONS = ("play", "pause", "next")
 VOLUME_TARGETS = ("music", "log")
@@ -148,6 +149,9 @@ def make_server(
             try:
                 if method == "GET" and path in ("/", "/index.html"):
                     self._send(200, INDEX_HTML.read_bytes(), "text/html; charset=utf-8")
+                    return
+                if method == "GET" and path == "/setup":
+                    self._send(200, SETUP_HTML.read_bytes(), "text/html; charset=utf-8")
                     return
                 handler = routes.get((method, path))
                 if handler is None:

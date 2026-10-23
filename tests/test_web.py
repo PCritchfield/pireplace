@@ -147,6 +147,11 @@ def test_index_served(srv):
     assert code == 200 and "text/html" in ctype and b"<html" in body
 
 
+def test_setup_page_served(srv):
+    code, body, ctype = get_raw(srv, "/setup")
+    assert code == 200 and "text/html" in ctype and b"<html" in body
+
+
 def test_unknown_path_is_404(srv):
     assert get_raw(srv, "/nope")[0] == 404
     assert post(srv, "/api/nope", {})[0] == 404
