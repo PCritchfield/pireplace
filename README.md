@@ -92,6 +92,12 @@ password). It needs `qrencode`. `build/` is gitignored, so the password stays ou
 of git. Don't leave the printed card where guests can read it if the password matters
 to you.
 
+The page answers to `pireplace.local`, `pireplace`, and the Pi's own IP address. If you
+reach it by another name (say a DNS entry on your router), add that name to the
+playbook's `pireplace_allowed_hosts` list and re-deploy (it becomes `allowed_hosts`
+under `[web]` in `/etc/pireplace/config.toml`, which each deploy rewrites); other names get
+"forbidden host". This stops other websites from driving the box through a guest's browser.
+
 **Guest Wi-Fi will not work.** Guest networks usually enable client isolation, so
 phones cannot reach the Pi and `http://pireplace.local` does not load. This is
 expected; join the main network.
@@ -103,6 +109,10 @@ If the Pi has no connection for about 5 minutes it opens a Wi-Fi network called
 known networks every 5 minutes. Join `pireplace-setup` on your phone, open
 `http://10.42.0.1/setup`, pick the network and enter its password. The hotspot
 goes away once the Pi has joined. A brief router outage does not start the hotspot.
+
+The setup page only exists while you are connected to the `pireplace-setup` hotspot:
+from the home network (or in laptop dev mode) `/setup` is "not found", so nobody on
+your Wi-Fi can change the Pi's network.
 
 ## Laptop development
 
@@ -141,7 +151,14 @@ sudo systemctl --user -M pireplace@ status pireplace-video pireplace-music
 sudo systemctl --user -M pireplace@ restart pireplace-music
 ```
 
-All four restart on their own after a crash (`Restart=always`). The exception: `pireplace-control` and `pireplace-wifi` stay down on exit status 2 (invalid config or hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and restart them.
+All four restart on their own after a crash (`Restart=always`, and systemd never gives up).
+The video player starts the fire on its own, even if the control page is down. While
+the control page runs it checks both players every 5 seconds: a player that restarted
+is reloaded within about 5 seconds, with the fire sound on at the saved volume and
+the music playing in the saved mood (paused instead if `start_music = false`). A
+restart of the control page itself changes nothing that is playing. The exception:
+`pireplace-control` and `pireplace-wifi` stay down on exit status 2 (invalid config or
+hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and restart them.
 
 - **Page says no fire videos or no moods:** add files, press Rescan media.
 - **`pireplace.local` does not resolve:** use the Pi's IP address from your router.
@@ -156,25 +173,41 @@ All four restart on their own after a crash (`Restart=always`). The exception: `
   ```
 
   `apt list -a mpv` shows available versions. `sudo apt-mark unhold mpv` when fixed.
-  Only security updates install automatically (unattended-upgrades).
+  Only security updates and the Raspberry Pi archive install automatically
+  (unattended-upgrades).
 - **Deploy fails on `hotspot_password`:** it is missing, not 8 to 63 characters,
   or still the `CHANGE_ME` placeholder.
+- **Deploy ends with "REBOOT REQUIRED":** the boot settings that keep console text off
+  the TV changed. Run `sudo reboot` on the Pi.
 
 ## Before the party
 
 Run through this on the real Pi 4 and tick each item.
 
+- [ ] Wi-Fi detection matches the code: on the Pi, connected to home Wi-Fi, run
+      `nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device`. The Wi-Fi line must read like
+      `wlan0:wifi:connected:<your network>` (TYPE `wifi` or `ethernet`, STATE exactly
+      `connected`); that is what `pireplace/wifi.py` looks for. If the format differs,
+      fix `connected()` before relying on the hotspot.
 - [ ] Power on with media present: fire and music within 60 s, no console text, no cursor.
+- [ ] Sound comes out of the TV (HDMI), not the Pi's 3.5 mm jack.
+- [ ] Boot with the TV in standby, then turn the TV on: picture and sound both work.
 - [ ] TV off then on: still playing.
 - [ ] Phone at `http://pireplace.local`: mood switch, pause/play, next, both volumes,
       log mute. Each affects only its own stream.
 - [ ] `sudo systemctl kill pireplace-control` and
       `sudo systemctl --user -M pireplace@ kill pireplace-music`: both return on their own;
       the video never stops.
+- [ ] `sudo systemctl --user -M pireplace@ restart pireplace-video` while playing: the fire
+      is back within about 5 s with its sound at the same volume.
 - [ ] Pull power, restore: same mood and volumes as before.
 - [ ] Router off for 2 minutes, then on: no hotspot appears, the box rejoins.
 - [ ] Forget the home network on the Pi, reboot: `pireplace-setup` appears after about
       5 minutes; the setup page joins a network; the hotspot disappears.
+- [ ] While on the hotspot, the Pi's address really is 10.42.0.1 (`http://10.42.0.1/setup`
+      loads; on the Pi `ip -4 addr show wlan0`). If not, re-deploy with
+      `-e pireplace_hotspot_address=<that address>` (in `ANSIBLE_ARGS`).
+- [ ] From the home network, `http://pireplace.local/setup` says not found.
 - [ ] Empty `/srv/pireplace/videos`, press Rescan: black screen, the page shows the
       message, nothing crash-loops (`sudo systemctl --user -M pireplace@ status pireplace-video`
       stays stable).
