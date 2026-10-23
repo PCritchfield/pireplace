@@ -22,7 +22,7 @@ setup_url="http://10.42.0.1/setup"
 
 esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"; }
 # An <img> with a data: URI avoids dealing with the XML header qrencode emits.
-qr() { qrencode -t SVG -m 2 -o - "$1" | base64 -w0; }
+qr() { qrencode -t SVG -m 2 -o - "$1" | base64 | tr -d '\n'; }
 
 remote_qr="$(qr "$remote_url")"
 setup_qr="$(qr "$setup_url")"

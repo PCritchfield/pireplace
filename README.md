@@ -110,14 +110,15 @@ The app runs on a laptop with mpv windows instead of the TV.
 
 ```sh
 sudo apt install mpv ffmpeg      # ffmpeg makes the sample media; qrencode only for the card
+python3 -m venv .venv            # needs python3-venv: sudo apt install python3-venv
+.venv/bin/pip install -e '.[dev]'
 make dev                         # sample media in .dev/media, UI at http://127.0.0.1:8080
 make test                        # pytest
 make lint                        # playbook and unit checks; reports what it skips
 ```
 
-Python 3.11+ and the standard library are all the runtime needs; pytest is a dev
-extra (`pip install -e '.[dev]'`).
-Keep the repo path short: dev sockets live in `.dev/run`, and Unix socket paths
+Python 3.11+ and the standard library are all the runtime needs; pytest is the
+only dev dependency. Keep the repo path short: dev sockets live in `.dev/run`, and Unix socket paths
 are limited to about 107 bytes.
 
 ## Troubleshooting
@@ -136,11 +137,11 @@ sudo systemctl status pireplace-control pireplace-wifi
 journalctl -u pireplace-control -e
 journalctl -u pireplace-wifi -e
 sudo journalctl --user -M pireplace@ -u pireplace-video -e
-systemctl --user -M pireplace@ status pireplace-video pireplace-music
-systemctl --user -M pireplace@ restart pireplace-music
+sudo systemctl --user -M pireplace@ status pireplace-video pireplace-music
+sudo systemctl --user -M pireplace@ restart pireplace-music
 ```
 
-All four restart on their own after a crash (`Restart=always`).
+All four restart on their own after a crash (`Restart=always`). The exception: `pireplace-control` and `pireplace-wifi` stay down on exit status 2 (invalid config or hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and restart them.
 
 - **Page says no fire videos or no moods:** add files, press Rescan media.
 - **`pireplace.local` does not resolve:** use the Pi's IP address from your router.
@@ -168,12 +169,12 @@ Run through this on the real Pi 4 and tick each item.
 - [ ] Phone at `http://pireplace.local`: mood switch, pause/play, next, both volumes,
       log mute. Each affects only its own stream.
 - [ ] `sudo systemctl kill pireplace-control` and
-      `systemctl --user -M pireplace@ kill pireplace-music`: both return on their own;
+      `sudo systemctl --user -M pireplace@ kill pireplace-music`: both return on their own;
       the video never stops.
 - [ ] Pull power, restore: same mood and volumes as before.
 - [ ] Router off for 2 minutes, then on: no hotspot appears, the box rejoins.
 - [ ] Forget the home network on the Pi, reboot: `pireplace-setup` appears after about
       5 minutes; the setup page joins a network; the hotspot disappears.
 - [ ] Empty `/srv/pireplace/videos`, press Rescan: black screen, the page shows the
-      message, nothing crash-loops (`systemctl --user -M pireplace@ status pireplace-video`
+      message, nothing crash-loops (`sudo systemctl --user -M pireplace@ status pireplace-video`
       stays stable).
