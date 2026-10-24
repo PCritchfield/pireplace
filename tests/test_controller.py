@@ -175,29 +175,30 @@ def test_same_pid_next_round_sends_nothing(env):
     assert [r for r in env.video.requests + env.music.requests if r[0] != "get_property"] == []
 
 
-def test_player_restart_with_new_pid_reloads_and_applies_boot_settings(env):
+def test_player_restart_with_new_pid_reloads_and_keeps_persisted_state(env):
     env.fp.reconcile()
     env.fp.set_log_muted(True)
     env.fp.pause()
-    # mpv restarted: new process, empty playlist, default properties.
+    saved = env.store.load()
+    # each mpv restarted: new process, empty playlist, default properties.
     env.video.props.update({"pid": 999, "playlist-count": 0, "mute": False, "volume": 100})
+    env.music.props.update({"pid": 555, "playlist-count": 0, "pause": False, "volume": 100})
     env.video.commands.clear()
-    env.music.requests.clear()
+    env.music.commands.clear()
     env.fp.reconcile()
     assert [c[2] for c in env.video.commands if c[0] == "loadfile"] == ["replace", "append"]
-    assert env.video.props["mute"] is False and env.video.props["volume"] == 40
-    assert env.store.load().log_muted is False
-    # the music player did not restart, so it is left alone (still paused)
-    assert [r for r in env.music.requests if r[0] != "get_property"] == []
-    assert env.music.props["pause"] is True
+    assert any(c[0] == "loadfile" for c in env.music.commands)
+    assert env.video.props["mute"] is True and env.video.props["volume"] == 40
+    assert env.music.props["pause"] is True and env.music.props["volume"] == 60
+    assert env.store.load() == saved
 
 
-def test_music_restart_applies_start_music(env):
+def test_music_restart_keeps_persisted_pause(env):
     env.fp.reconcile()
     env.fp.pause()
     env.music.props.update({"pid": 555, "playlist-count": 0, "pause": False})
     env.fp.reconcile()
-    assert env.music.props["pause"] is False and env.store.load().music_playing is True
+    assert env.music.props["pause"] is True and env.store.load().music_playing is False
     assert any(c[0] == "loadfile" for c in env.music.commands)
 
 
@@ -242,7 +243,7 @@ def test_reconcile_does_not_save_when_nothing_changed(env, monkeypatch):
     saves = []
     monkeypatch.setattr(env.store, "save", lambda st: saves.append(st))
     env.fp.reconcile()
-    env.video.props["pid"] = 12345  # restart, but state already matches boot defaults
+    env.video.props["pid"] = 12345  # restart, but the persisted state is already applied
     env.fp.reconcile()
     assert saves == []
 

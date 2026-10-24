@@ -87,9 +87,10 @@ class Fireplace:
 
         Per player, keyed on mpv's `pid`:
         - same pid as last round: nothing to do (no commands, no writes);
-        - first sight during a boot (no boot marker), or a new pid (mpv restarted):
-          boot defaults - log sound on, music playing unless start_music is false;
-        - first sight after a controller restart (marker present): the persisted state.
+        - first sight during a boot (no boot marker): boot defaults - log sound on,
+          music playing unless start_music is false;
+        - otherwise (controller restart, or a new pid because mpv restarted): the
+          persisted state is applied again.
         Either way an empty player is (re)loaded. A player that is down or errors is
         skipped this round; the other is still handled.
         """
@@ -107,7 +108,7 @@ class Fireplace:
                 if last is not None and pid == last:
                     continue
                 restarted = last is not None
-                state = apply(state, boot_defaults=self._boot or restarted)
+                state = apply(state, boot_defaults=self._boot)
             except (MpvUnavailable, MpvError, OSError) as e:
                 if name not in self._down:
                     log.warning("%s player not ready, will retry: %s", name, e)

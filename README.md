@@ -154,9 +154,9 @@ sudo systemctl --user -M pireplace@ restart pireplace-music
 All four restart on their own after a crash (`Restart=always`, and systemd never gives up).
 The video player starts the fire on its own, even if the control page is down. While
 the control page runs it checks both players every 5 seconds: a player that restarted
-is reloaded within about 5 seconds, with the fire sound on at the saved volume and
-the music playing in the saved mood (paused instead if `start_music = false`). A
-restart of the control page itself changes nothing that is playing. The exception:
+is reloaded within about 5 seconds and gets your saved settings back (mood, volumes,
+log mute, music pause); only a fresh boot starts from the defaults (fire sound on, music
+playing unless `start_music = false`). A restart of the control page itself changes nothing that is playing. The exception:
 `pireplace-control` and `pireplace-wifi` stay down on exit status 2 (invalid config or
 hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and restart them.
 
@@ -199,7 +199,7 @@ Run through this on the real Pi 4 and tick each item.
       `sudo systemctl --user -M pireplace@ kill pireplace-music`: both return on their own;
       the video never stops.
 - [ ] `sudo systemctl --user -M pireplace@ restart pireplace-video` while playing: the fire
-      is back within about 5 s with its sound at the same volume.
+      is back within about 5 s with its sound at the same volume and mute setting.
 - [ ] Pull power, restore: same mood and volumes as before.
 - [ ] Router off for 2 minutes, then on: no hotspot appears, the box rejoins.
 - [ ] Forget the home network on the Pi, reboot: `pireplace-setup` appears after about
