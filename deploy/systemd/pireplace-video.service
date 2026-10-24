@@ -15,7 +15,9 @@ Type=simple
 NoNewPrivileges=yes
 # The video folder is on the command line so the fire plays even if the controller is down;
 # the controller then only applies volume/mute (and reloads after a rescan).
-ExecStart=/usr/bin/mpv --vo=gpu --gpu-context=drm --hwdec=auto-safe --fullscreen --idle=yes --loop-playlist=inf --no-osc --osd-level=0 --no-input-default-bindings --input-ipc-server=/run/pireplace/video.sock --really-quiet /srv/pireplace/videos
+# --volume=40 matches the default log_volume, so after a restart or boot the fire sound
+# starts at that level instead of mpv's 100% until the controller applies the saved volume.
+ExecStart=/usr/bin/mpv --volume=40 --vo=gpu --gpu-context=drm --hwdec=auto-safe --fullscreen --idle=yes --loop-playlist=inf --no-osc --osd-level=0 --no-input-default-bindings --input-ipc-server=/run/pireplace/video.sock --really-quiet /srv/pireplace/videos
 Restart=always
 RestartSec=2
 

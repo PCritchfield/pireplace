@@ -30,6 +30,7 @@ def unit(name: str) -> dict[str, dict[str, list[str]]]:
 def test_video_unit_plays_the_video_dir_without_the_controller():
     exec_start = unit("pireplace-video.service")["Service"]["ExecStart"][0]
     assert exec_start.split()[-1] == "/srv/pireplace/videos"
+    assert "--volume=40" in exec_start.split()
 
 
 def test_control_unit_can_write_the_boot_marker():
