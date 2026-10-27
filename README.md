@@ -50,7 +50,9 @@ on the TV is the fire.
    The settings that hide console text and the cursor on the TV only take effect
    after a reboot. Log out and in again too, so your SSH user picks up the
    `pireplace` group (needed to write media). The deploy also removes `console=tty1`
-   and disables cloud-init, so boot messages go to the serial port only.
+   and disables cloud-init, so boot messages go to the serial port only. The
+   emergency/rescue shell leaves HDMI too, so recovery needs a serial console, or the SD
+   card in another machine / a re-flash.
 
 `make deploy` needs `ansible-playbook` on your laptop. If you installed Ansible in
 `.venv`, the Makefile uses it.

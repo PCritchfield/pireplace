@@ -320,12 +320,22 @@
       ansible.builtin.replace:
         path: /boot/firmware/cmdline.txt
         # Remove only the whole token (and the space after it); console=serial0 stays.
+        # This also moves the emergency/rescue shell off HDMI: recovery then needs a
+        # serial console, or the SD card in another machine / a re-flash.
         regexp: '(?<!\S)console=tty1(?!\S)[ \t]*'
         replace: ''
       register: pireplace_console
 
     # Imager's first-boot settings (user, Wi-Fi via netplan, hostname) are already
     # applied and persist without cloud-init. To undo: delete this file.
+    - name: Ensure /etc/cloud exists
+      ansible.builtin.file:
+        path: /etc/cloud
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Disable cloud-init so its per-boot stages stay off the TV
       ansible.builtin.file:
         path: /etc/cloud/cloud-init.disabled
