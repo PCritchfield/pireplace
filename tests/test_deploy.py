@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 UNITS = ROOT / "deploy" / "systemd"
@@ -107,10 +108,68 @@ def test_playbook_says_reboot_required_when_boot_files_change():
         assert f"{name} is changed" in last_task
 
 
-def test_playbook_drops_console_tty1_and_disables_cloud_init():
-    m = re.search(r"regexp: '([^']*console=tty1[^']*)'", SITE)
-    assert m
-    line = "console=serial0,115200 console=tty1 root=PARTUUID=x rootwait quiet"
-    assert re.sub(m.group(1), "", line) == "console=serial0,115200 root=PARTUUID=x rootwait quiet"
-    assert re.sub(m.group(1), "", "a console=tty10 b") == "a console=tty10 b"
+REAL_CMDLINE = (
+    "console=serial0,115200 console=tty1 root=PARTUUID=decadd98-02 rootfstype=ext4 "
+    "fsck.repair=yes rootwait ds=nocloud;i=rpi-imager-1792976701367 "
+    "cfg80211.ieee80211_regdom=US quiet loglevel=3 logo.nologo "
+    "vt.global_cursor_default=0 consoleblank=0"
+)
+
+
+def _console_tasks():
+    tasks = [
+        t["ansible.builtin.replace"]
+        for play in yaml.safe_load(SITE)
+        for t in play.get("tasks", [])
+        if "ansible.builtin.replace" in t
+        and t["ansible.builtin.replace"]["path"] == "/boot/firmware/cmdline.txt"
+    ]
+    assert len(tasks) == 3
+    return tasks
+
+
+def _run_console_tasks(line):
+    changed = False
+    for t in _console_tasks():
+        new = re.sub(t["regexp"], t["replace"], line, flags=re.MULTILINE)
+        changed |= new != line
+        line = new
+    return line, changed
+
+
+def test_console_tty1_becomes_tty3_on_real_pi_cmdline():
+    out, changed = _run_console_tasks(REAL_CMDLINE)
+    assert changed
+    assert out == REAL_CMDLINE.replace("console=tty1", "console=tty3")
+    assert "\n" not in out
+
+
+def test_console_task_is_idempotent_on_fixed_cmdline():
+    fixed = REAL_CMDLINE.replace("console=tty1", "console=tty3")
+    assert _run_console_tasks(fixed) == (fixed, False)
+    once, _ = _run_console_tasks(REAL_CMDLINE)
+    assert _run_console_tasks(once) == (once, False)
+
+
+def test_console_task_never_leaves_no_tty_console():
+    cases = [
+        REAL_CMDLINE,
+        "console=serial0,115200 root=/dev/x rootwait",
+        "root=/dev/x rootwait",
+        "console=tty10 root=/dev/x",
+        "console=tty1",
+    ]
+    for line in cases:
+        out, _ = _run_console_tasks(line)
+        assert "console=tty3" in out.split()
+        assert "console=tty1" not in out.split()
+        assert "\n" not in out
+    out, _ = _run_console_tasks("console=serial0,115200 root=/dev/x rootwait")
+    assert out == "console=serial0,115200 console=tty3 root=/dev/x rootwait"
+    out, _ = _run_console_tasks("root=/dev/x rootwait")
+    assert out == "console=tty3 root=/dev/x rootwait"
+
+
+def test_playbook_warns_about_last_console_and_disables_cloud_init():
+    assert "never remove the last usable console" in SITE
     assert "path: /etc/cloud/cloud-init.disabled" in SITE

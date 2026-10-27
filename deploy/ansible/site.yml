@@ -316,15 +316,33 @@
         backrefs: true
       register: pireplace_cmdline
 
-    - name: Keep boot messages off the TV by dropping console=tty1 (takes effect after a reboot)
+    # WARNING: never remove the last usable console from cmdline.txt. On the Pi 4 the
+    # firmware passes 8250.nr_uarts=0, so console=serial0 is NOT usable; with no tty
+    # console the boot stalls before userspace. Move the console to the invisible tty3
+    # instead of deleting it (the HDMI screen is tty1 and stays blank). Boot messages
+    # and the rescue shell are then on tty3 (Ctrl+Alt+F3, or `journalctl -b`).
+    - name: Move the boot console from tty1 to tty3 so boot text stays off the TV (takes effect after a reboot)
       ansible.builtin.replace:
         path: /boot/firmware/cmdline.txt
-        # Remove only the whole token (and the space after it); console=serial0 stays.
-        # This also moves the emergency/rescue shell off HDMI: recovery then needs a
-        # serial console, or the SD card in another machine / a re-flash.
-        regexp: '(?<!\S)console=tty1(?!\S)[ \t]*'
-        replace: ''
+        regexp: '(?<!\S)console=tty1(?!\S)'
+        replace: 'console=tty3'
       register: pireplace_console
+
+    # Neither tty1 nor tty3 present: add tty3 after console=serial0,115200 ...
+    - name: Ensure a tty3 console exists (after console=serial0,115200)
+      ansible.builtin.replace:
+        path: /boot/firmware/cmdline.txt
+        regexp: '^(?!.*(?<!\S)console=tty3(?!\S))(.*?(?<!\S)console=serial0,115200(?!\S))'
+        replace: '\1 console=tty3'
+      register: pireplace_console_serial
+
+    # ... or, with no serial0 token either, at the start of the line.
+    - name: Ensure a tty3 console exists (at the start if no serial0 token)
+      ansible.builtin.replace:
+        path: /boot/firmware/cmdline.txt
+        regexp: '^(?!.*(?<!\S)console=tty3(?!\S))'
+        replace: 'console=tty3 '
+      register: pireplace_console_start
 
     # Imager's first-boot settings (user, Wi-Fi via netplan, hostname) are already
     # applied and persist without cloud-init. To undo: delete this file.
@@ -364,7 +382,7 @@
         msg: >-
           REBOOT REQUIRED: /boot/firmware/cmdline.txt or config.txt changed. Run
           `sudo reboot` on the Pi so the TV shows only the fire.
-      when: pireplace_cmdline is changed or pireplace_console is changed or pireplace_configtxt is changed
+      when: pireplace_cmdline is changed or pireplace_console is changed or pireplace_console_serial is changed or pireplace_console_start is changed or pireplace_configtxt is changed
 
   handlers:
     - name: Reload systemd
