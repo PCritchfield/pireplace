@@ -49,7 +49,8 @@ on the TV is the fire.
 5. **Reboot the Pi once** after the first deploy (`ssh <user>@pireplace.local sudo reboot`).
    The settings that hide console text and the cursor on the TV only take effect
    after a reboot. Log out and in again too, so your SSH user picks up the
-   `pireplace` group (needed to write media).
+   `pireplace` group (needed to write media). The deploy also removes `console=tty1`
+   and disables cloud-init, so boot messages go to the serial port only.
 
 `make deploy` needs `ansible-playbook` on your laptop. If you installed Ansible in
 `.venv`, the Makefile uses it.
@@ -177,6 +178,8 @@ hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and r
   (unattended-upgrades).
 - **Deploy fails on `hotspot_password`:** it is missing, not 8 to 63 characters,
   or still the `CHANGE_ME` placeholder.
+- **Boot messages are gone from the TV:** that is intended. Read them over a serial
+  console or with `journalctl -b` on the Pi.
 - **Deploy ends with "REBOOT REQUIRED":** the boot settings that keep console text off
   the TV changed. Run `sudo reboot` on the Pi.
 

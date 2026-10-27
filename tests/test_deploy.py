@@ -102,4 +102,15 @@ def test_playbook_says_reboot_required_when_boot_files_change():
     assert "register: pireplace_cmdline" in SITE and "register: pireplace_configtxt" in SITE
     last_task = SITE.split("\n  handlers:", 1)[0].rsplit("- name:", 1)[1]
     assert "REBOOT REQUIRED" in last_task
-    assert "pireplace_cmdline is changed or pireplace_configtxt is changed" in last_task
+    assert "register: pireplace_console" in SITE
+    for name in ("pireplace_cmdline", "pireplace_console", "pireplace_configtxt"):
+        assert f"{name} is changed" in last_task
+
+
+def test_playbook_drops_console_tty1_and_disables_cloud_init():
+    m = re.search(r"regexp: '([^']*console=tty1[^']*)'", SITE)
+    assert m
+    line = "console=serial0,115200 console=tty1 root=PARTUUID=x rootwait quiet"
+    assert re.sub(m.group(1), "", line) == "console=serial0,115200 root=PARTUUID=x rootwait quiet"
+    assert re.sub(m.group(1), "", "a console=tty10 b") == "a console=tty10 b"
+    assert "path: /etc/cloud/cloud-init.disabled" in SITE

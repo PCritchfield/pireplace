@@ -316,6 +316,26 @@
         backrefs: true
       register: pireplace_cmdline
 
+    - name: Keep boot messages off the TV by dropping console=tty1 (takes effect after a reboot)
+      ansible.builtin.replace:
+        path: /boot/firmware/cmdline.txt
+        # Remove only the whole token (and the space after it); console=serial0 stays.
+        regexp: '(?<!\S)console=tty1(?!\S)[ \t]*'
+        replace: ''
+      register: pireplace_console
+
+    # Imager's first-boot settings (user, Wi-Fi via netplan, hostname) are already
+    # applied and persist without cloud-init. To undo: delete this file.
+    - name: Disable cloud-init so its per-boot stages stay off the TV
+      ansible.builtin.file:
+        path: /etc/cloud/cloud-init.disabled
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+        modification_time: preserve
+        access_time: preserve
+
     - name: Disable the firmware splash (takes effect after a reboot)
       ansible.builtin.lineinfile:
         path: /boot/firmware/config.txt
@@ -334,7 +354,7 @@
         msg: >-
           REBOOT REQUIRED: /boot/firmware/cmdline.txt or config.txt changed. Run
           `sudo reboot` on the Pi so the TV shows only the fire.
-      when: pireplace_cmdline is changed or pireplace_configtxt is changed
+      when: pireplace_cmdline is changed or pireplace_console is changed or pireplace_configtxt is changed
 
   handlers:
     - name: Reload systemd
