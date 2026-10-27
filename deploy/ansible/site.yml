@@ -332,7 +332,7 @@
     - name: Ensure a tty3 console exists (after console=serial0,115200)
       ansible.builtin.replace:
         path: /boot/firmware/cmdline.txt
-        regexp: '^(?!.*(?<!\S)console=tty3(?!\S))(.*?(?<!\S)console=serial0,115200(?!\S))'
+        regexp: '\A(?!.*(?<!\S)console=tty3(?!\S))(.*?(?<!\S)console=serial0,115200(?!\S))'
         replace: '\1 console=tty3'
       register: pireplace_console_serial
 
@@ -340,7 +340,7 @@
     - name: Ensure a tty3 console exists (at the start if no serial0 token)
       ansible.builtin.replace:
         path: /boot/firmware/cmdline.txt
-        regexp: '^(?!.*(?<!\S)console=tty3(?!\S))'
+        regexp: '\A(?!.*(?<!\S)console=tty3(?!\S))'
         replace: 'console=tty3 '
       register: pireplace_console_start
 

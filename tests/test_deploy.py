@@ -129,12 +129,15 @@ def _console_tasks():
 
 
 def _run_console_tasks(line):
+    # cmdline.txt ends with a newline; ^ in MULTILINE would also match after it.
     changed = False
+    line += "\n"
     for t in _console_tasks():
         new = re.sub(t["regexp"], t["replace"], line, flags=re.MULTILINE)
         changed |= new != line
         line = new
-    return line, changed
+    assert line.endswith("\n") and line.count("\n") == 1
+    return line[:-1], changed
 
 
 def test_console_tty1_becomes_tty3_on_real_pi_cmdline():
