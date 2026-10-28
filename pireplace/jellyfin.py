@@ -73,7 +73,8 @@ class JellyfinClient:
         self._api_key = api_key
         self._user_id = user_id
         self._timeout = timeout
-        self._opener = urllib.request.build_opener(_NoRedirect)
+        # ProxyHandler({}): never send the token through a proxy taken from the environment.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
     def _request(self, path: str, query: str = ""):
         """Open GET path. Returns (response, None) or (None, error message)."""

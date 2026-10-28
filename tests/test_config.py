@@ -173,3 +173,48 @@ def test_read_api_key_missing_file(tmp_path):
     cfg = load_jellyfin_config(_write(tmp_path, JF_TOML))
     with pytest.raises(ConfigError, match="cannot read api_key_file"):
         read_api_key(replace(cfg, api_key_file=tmp_path / "nope"))
+
+
+# --- systemd credential (LoadCredential=jellyfin.key:...) ---
+
+
+def test_read_api_key_prefers_the_systemd_credential(tmp_path):
+    cfg = load_jellyfin_config(_write(tmp_path, JF_TOML))
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "jellyfin.key").write_text("from-credential\n")
+    fallback = tmp_path / "k"
+    fallback.write_text("from-file\n")
+    cfg = replace(cfg, api_key_file=fallback)
+    assert read_api_key(cfg, environ={"CREDENTIALS_DIRECTORY": str(creds)}) == "from-credential"
+
+
+def test_read_api_key_falls_back_without_the_credential(tmp_path):
+    cfg = load_jellyfin_config(_write(tmp_path, JF_TOML))
+    fallback = tmp_path / "k"
+    fallback.write_text("from-file\n")
+    cfg = replace(cfg, api_key_file=fallback)
+    empty = tmp_path / "creds"
+    empty.mkdir()  # set, but holds no jellyfin.key
+    assert read_api_key(cfg, environ={"CREDENTIALS_DIRECTORY": str(empty)}) == "from-file"
+    assert read_api_key(cfg, environ={}) == "from-file"
+    assert read_api_key(cfg, environ={"CREDENTIALS_DIRECTORY": ""}) == "from-file"
+
+
+def test_read_api_key_empty_credential_is_an_error_naming_it(tmp_path):
+    cfg = load_jellyfin_config(_write(tmp_path, JF_TOML))
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "jellyfin.key").write_text("\n")
+    with pytest.raises(ConfigError) as e:
+        read_api_key(cfg, environ={"CREDENTIALS_DIRECTORY": str(creds)})
+    assert str(e.value) == f"jellyfin: cannot read api_key_file {creds / 'jellyfin.key'}"
+
+
+def test_read_api_key_uses_the_process_environment_by_default(tmp_path, monkeypatch):
+    cfg = load_jellyfin_config(_write(tmp_path, JF_TOML))
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "jellyfin.key").write_text("env-key")
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
+    assert read_api_key(replace(cfg, api_key_file=tmp_path / "nope")) == "env-key"

@@ -125,3 +125,16 @@ def test_unreachable_server_is_jellyfin_error(tmp_path):
     with pytest.raises(JellyfinError):
         c.download("a" * 32, dest)
     assert not dest.exists()
+
+
+def test_environment_proxy_is_never_used(fake, monkeypatch):
+    # A proxy from the environment would see the token; the client must ignore it.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+    for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(var, f"http://127.0.0.1:{dead}")
+    for var in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    fake.playlists[PL] = [item("a" * 32, "A", "T", "flac", 1)]
+    assert [t.id for t in client(fake).playlist_tracks(PL)] == ["a" * 32]

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -172,12 +174,32 @@ def load_jellyfin_config(path: Path) -> JellyfinConfig | None:
     return JellyfinConfig(url=url, user_id=user_id, api_key_file=key_file, playlists=playlists)
 
 
-def read_api_key(cfg: JellyfinConfig) -> str:
-    """Return the stripped contents of the key file. Never echoes the contents."""
+CREDENTIAL_NAME = "jellyfin.key"
+
+
+def api_key_path(cfg: JellyfinConfig, environ: Mapping[str, str] | None = None) -> Path:
+    """Where the key is read from.
+
+    Under systemd (pireplace-sync.service: LoadCredential=jellyfin.key:...) the key is
+    $CREDENTIALS_DIRECTORY/jellyfin.key, readable only by this unit; the file in /etc is
+    root-only. Elsewhere (a hand run, tests) it is ``api_key_file``.
+    """
+    environ = os.environ if environ is None else environ
+    creds = environ.get("CREDENTIALS_DIRECTORY")
+    if creds:
+        candidate = Path(creds) / CREDENTIAL_NAME
+        if candidate.is_file():
+            return candidate
+    return cfg.api_key_file
+
+
+def read_api_key(cfg: JellyfinConfig, environ: Mapping[str, str] | None = None) -> str:
+    """Return the stripped key (see api_key_path). Never echoes the contents."""
+    path = api_key_path(cfg, environ)
     try:
-        key = cfg.api_key_file.read_text().strip()
+        key = path.read_text().strip()
     except (OSError, UnicodeDecodeError):
         key = ""
     if not key:
-        raise ConfigError(f"jellyfin: cannot read api_key_file {cfg.api_key_file}")
+        raise ConfigError(f"jellyfin: cannot read api_key_file {path}")
     return key

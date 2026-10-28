@@ -288,7 +288,8 @@ def test_jellyfin_key_file_is_secret_and_only_present_with_a_key():
                    and t["ansible.builtin.copy"].get("dest") == "/etc/pireplace/jellyfin.key")
     copy = present["ansible.builtin.copy"]
     assert present["no_log"] is True
-    assert copy["mode"] == "0640" and copy["owner"] == "root" and copy["group"] == "{{ pireplace_user }}"
+    # root-only: the sync unit receives it through LoadCredential, nothing else can read it
+    assert copy["mode"] == "0600" and copy["owner"] == "root" and copy["group"] == "root"
     assert present["when"] == "pireplace_jf_enabled"
     absent = next(t for t in _tasks() if "ansible.builtin.file" in t
                   and t["ansible.builtin.file"].get("path") == "/etc/pireplace/jellyfin.key")
@@ -393,3 +394,43 @@ def test_template_renders_a_loadable_jellyfin_section_only_with_a_key(tmp_path):
         plain = _render_config(extra, directory)
         assert "jellyfin" not in tomllib.loads(plain.read_text())
         assert load_jellyfin_config(plain) is None
+
+
+def test_sync_service_reads_the_key_as_a_systemd_credential():
+    service = unit("pireplace-sync.service")["Service"]
+    assert service["LoadCredential"] == ["jellyfin.key:/etc/pireplace/jellyfin.key"]
+
+
+def test_sync_service_network_is_confined_to_loopback_and_the_tailnet():
+    service = unit("pireplace-sync.service")["Service"]
+    assert service["IPAddressDeny"] == ["any"]
+    assert service["IPAddressAllow"] == ["localhost"]  # the rescan call; Jellyfin via the drop-in
+    assert service["RestrictNetworkInterfaces"] == ["lo tailscale0"]
+    assert service["CapabilityBoundingSet"] == [""]
+    assert service["PrivateIPC"] == ["yes"]
+    assert service["SystemCallFilter"] == ["@system-service"]
+
+
+def test_sync_dropin_allows_only_the_jellyfin_host():
+    play = yaml.safe_load(SITE)[1]
+    assert play["vars"]["pireplace_jf_host"] == "{{ pireplace_jf_url | urlsplit('hostname') }}"
+    dropin = _task("Allow the sync service to reach the Jellyfin server")
+    copy = dropin["ansible.builtin.copy"]
+    assert copy["dest"] == "/etc/systemd/system/pireplace-sync.service.d/50-jellyfin-address.conf"
+    assert "[Service]\nIPAddressAllow={{ pireplace_jf_host }}/32\n" in copy["content"]
+    assert dropin["when"] == "pireplace_jf_enabled"
+    assert dropin["notify"] == "Reload systemd"
+    removal = _task("Remove the sync unit drop-ins")
+    assert removal["ansible.builtin.file"] == {
+        "path": "/etc/systemd/system/pireplace-sync.service.d", "state": "absent"}
+    assert removal["when"] == "not pireplace_jf_enabled"
+    check = _task("Require an IPv4 address in the Jellyfin URL")
+    assert check["when"] == "pireplace_jf_enabled"
+    pattern = re.search(r"match\('(.+)'\)", check["ansible.builtin.assert"]["that"][0]).group(1)
+    assert re.match(pattern, "100.88.8.6") and not re.match(pattern, "omarchy.tail1234.ts.net")
+
+
+def test_control_page_refuses_the_tailnet():
+    service = unit("pireplace-control.service")["Service"]
+    assert service["IPAddressDeny"] == ["100.64.0.0/10 fd7a:115c:a1e0::/48"]
+    assert "IPAddressAllow" not in service  # hotspot (10.42.0.0/24) and home LAN stay reachable

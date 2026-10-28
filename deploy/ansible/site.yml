@@ -65,6 +65,9 @@
     # live in the pireplace_jf_* names and an inventory override is read through them.
     pireplace_jf_enabled: "{{ (pireplace_jellyfin_api_key | default('') | string | length) > 0 }}"
     pireplace_jf_url: "{{ pireplace_jellyfin_url | default('http://100.88.8.6:8096') }}"
+    # The sync unit may only reach this address (IPAddressAllow drop-in), so the URL
+    # must name the server by its Tailscale IPv4 address.
+    pireplace_jf_host: "{{ pireplace_jf_url | urlsplit('hostname') }}"
     pireplace_jf_user_id: "{{ pireplace_jellyfin_user_id | default('1b7ed00cbdcc4a1eb624738191ca4efd') }}"
     pireplace_jf_playlists: "{{ pireplace_jellyfin_playlists | default(pireplace_jf_default_playlists) }}"
     pireplace_jf_default_playlists:
@@ -84,6 +87,17 @@
           - ansible_facts['python']['version_info'][1] >= 11
         fail_msg: pireplace needs Python 3.11+; use Raspberry Pi OS Bookworm or newer.
         quiet: true
+
+    - name: Require an IPv4 address in the Jellyfin URL (the sync unit may reach only it)
+      ansible.builtin.assert:
+        that:
+          - pireplace_jf_host is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+        fail_msg: >-
+          pireplace_jellyfin_url must name the Jellyfin server by its Tailscale IPv4
+          address (http://100.x.y.z:8096), not a host name: the sync service is only
+          allowed to connect to that address.
+        quiet: true
+      when: pireplace_jf_enabled
 
     # --- identity and packages -------------------------------------------------
 
@@ -316,18 +330,19 @@
       no_log: true
       notify: Restart pireplace system services
 
-    # Read by the sync service as the pireplace group; the key itself is not in config.toml.
-    - name: Install the Jellyfin API key file
+    # Root-only: pireplace-sync.service gets a copy through LoadCredential. The token is
+    # never in config.toml.
+    - name: Install the Jellyfin access token file
       ansible.builtin.copy:
         dest: /etc/pireplace/jellyfin.key
         content: "{{ pireplace_jellyfin_api_key }}\n"
         owner: root
-        group: "{{ pireplace_user }}"
-        mode: "0640"
+        group: root
+        mode: "0600"
       when: pireplace_jf_enabled
       no_log: true
 
-    - name: Remove the Jellyfin API key file (no key configured)
+    - name: Remove the Jellyfin access token file (no key configured)
       ansible.builtin.file:
         path: /etc/pireplace/jellyfin.key
         state: absent
@@ -382,6 +397,36 @@
         mode: "0644"
       loop: "{{ pireplace_sync_units }}"
       when: pireplace_jf_enabled
+      notify: Reload systemd
+
+    - name: Create the sync unit drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/pireplace-sync.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: pireplace_jf_enabled
+
+    - name: Allow the sync service to reach the Jellyfin server (and nothing else off the Pi)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pireplace-sync.service.d/50-jellyfin-address.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible: the host of pireplace_jellyfin_url. The unit itself denies
+          # every address but loopback.
+          [Service]
+          IPAddressAllow={{ pireplace_jf_host }}/32
+      when: pireplace_jf_enabled
+      notify: Reload systemd
+
+    - name: Remove the sync unit drop-ins (no key configured)
+      ansible.builtin.file:
+        path: /etc/systemd/system/pireplace-sync.service.d
+        state: absent
+      when: not pireplace_jf_enabled
       notify: Reload systemd
 
     - name: Look for installed Jellyfin sync units

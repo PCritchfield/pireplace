@@ -19,12 +19,28 @@ IOSchedulingClass=idle
 
 # Group-writable files so the SSH admin user (in the pireplace group) can manage them.
 UMask=0002
-# The only writable path is the music tree. The API key is read from /etc/pireplace.
+# The only writable path is the music tree.
 ReadWritePaths=/srv/pireplace/music
 
-# Hardening, as pireplace-control.service. Network access is needed for Jellyfin (over
-# Tailscale) and the loopback rescan call; AF_UNIX for name resolution and logging.
+# The access token. /etc/pireplace/jellyfin.key is root:root 0600; systemd (as root)
+# hands this unit a private copy in $CREDENTIALS_DIRECTORY, which pireplace sync
+# prefers over api_key_file. The control page, Wi-Fi watcher and players cannot read it.
+LoadCredential=jellyfin.key:/etc/pireplace/jellyfin.key
+
+# Network: loopback (the rescan call to the control page) plus the Jellyfin server's
+# tailnet address, which Ansible adds in pireplace-sync.service.d/50-jellyfin-address.conf.
+# Nothing else is reachable, and only over lo and the Tailscale interface.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNetworkInterfaces=lo tailscale0
+
+# Hardening, as pireplace-control.service, plus no capabilities, no SysV IPC and the
+# common system-call set. AF_UNIX for logging.
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateIPC=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
