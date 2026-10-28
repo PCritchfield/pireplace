@@ -32,6 +32,11 @@ RECONCILE_S = 5
 LOG_EVERY_S = 60
 DEFAULT_CONFIG = "/etc/pireplace/config.toml"
 
+# mpv answers slowly while it opens a multi-GB video; 1 s made /api/status report
+# the player unavailable for a few seconds.
+PLAYER_TIMEOUT = 3.0
+
+
 
 def reconcile_forever(
     fireplace: Fireplace,
@@ -79,8 +84,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     fireplace = Fireplace(
         config,
         StateStore(config.state_file, defaults),
-        MpvClient(config.video_socket),
-        MpvClient(config.music_socket),
+        MpvClient(config.video_socket, timeout=PLAYER_TIMEOUT),
+        MpvClient(config.music_socket, timeout=PLAYER_TIMEOUT),
     )
     try:
         extra = setup_routes(Nmcli(run_command), scan_cache_path(config))

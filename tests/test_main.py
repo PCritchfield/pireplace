@@ -97,3 +97,24 @@ def test_serve_passes_host_and_hotspot_settings_to_the_server(tmp_path, monkeypa
     p.write_text('[web]\nallowed_hosts = ["fire.local"]\n[wifi]\nhotspot_address = "10.1.1.1"\n')
     assert main(["serve", "--config", str(p)]) == 1
     assert seen["allowed_hosts"] == ("fire.local",) and seen["hotspot_address"] == "10.1.1.1"
+
+
+def test_serve_gives_players_a_timeout_that_survives_opening_a_large_file(tmp_path, monkeypatch):
+    import pireplace.__main__ as m
+
+    clients = []
+    real = m.MpvClient
+
+    def spy(*args, **kw):
+        clients.append(real(*args, **kw))
+        return clients[-1]
+
+    def fake_make_server(*args, **kw):
+        raise OSError("stop here")
+
+    monkeypatch.setattr(m, "MpvClient", spy)
+    monkeypatch.setattr(m, "make_server", fake_make_server)
+    p = tmp_path / "c.toml"
+    p.write_text("")
+    assert main(["serve", "--config", str(p)]) == 1
+    assert len(clients) == 2 and all(c.timeout == 3.0 for c in clients)
