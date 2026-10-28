@@ -10,10 +10,12 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from pireplace.config import ConfigError, load_config
+from pireplace.config import ConfigError, load_config, load_jellyfin_config, read_api_key
 from pireplace.controller import Fireplace
+from pireplace.jellyfin import JellyfinClient
 from pireplace.mpv import MpvClient
 from pireplace.state import State, StateStore
+from pireplace.sync import run_sync, trigger_rescan
 from pireplace.web import make_server
 from pireplace.wifi import (
     MAX_PSK,
@@ -137,6 +139,22 @@ def cmd_wifi_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    path = Path(args.config)
+    try:
+        config = load_config(path)
+        jf = load_jellyfin_config(path)
+        if jf is None:
+            print(f"pireplace: no [jellyfin] section in {path}", file=sys.stderr)
+            return 2
+        api_key = read_api_key(jf)
+    except ConfigError as e:
+        print(f"pireplace: {e}", file=sys.stderr)
+        return 2
+    client = JellyfinClient(jf.url, api_key, jf.user_id)
+    return run_sync(config, jf, client, lambda: trigger_rescan(config.port))
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="pireplace")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -148,6 +166,10 @@ def main(argv: list[str]) -> int:
     wifi = sub.add_parser("wifi-watch", help="start the setup hotspot when Wi-Fi is down")
     wifi.add_argument("--config", default=DEFAULT_CONFIG, help="path to config.toml")
     wifi.set_defaults(func=cmd_wifi_watch)
+
+    sync = sub.add_parser("sync", help="mirror the Jellyfin mood playlists into the music folders")
+    sync.add_argument("--config", default=DEFAULT_CONFIG, help="path to config.toml")
+    sync.set_defaults(func=cmd_sync)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")

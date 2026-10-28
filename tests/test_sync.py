@@ -259,3 +259,125 @@ def test_two_tracks_same_name_different_ids_both_kept(tmp_path):
     res = run(FakeClient([a, b]), tmp_path)
     assert res.added == 2
     assert len(files(tmp_path)) == 2
+
+
+# --- run_sync / trigger_rescan -------------------------------------------------
+
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from pireplace.config import JellyfinConfig, load_config
+from pireplace.sync import run_sync, trigger_rescan
+
+
+def _config(tmp_path, port=80):
+    p = tmp_path / "etc" / "config.toml"
+    p.parent.mkdir(exist_ok=True)
+    p.write_text(f'[media]\nmusic_dir = "{tmp_path / "music"}"\n[web]\nport = {port}\n')
+    return load_config(p)
+
+
+def _jf(tmp_path, *moods):
+    return JellyfinConfig(
+        url="http://x", user_id="u" * 32, api_key_file=tmp_path / "k",
+        playlists={m: "p" * 32 for m in moods},
+    )
+
+
+class PerMood:
+    """Client whose playlist_tracks answers by playlist id."""
+
+    def __init__(self, by_id):
+        self.by_id = by_id
+
+    def playlist_tracks(self, playlist_id):
+        r = self.by_id[playlist_id]
+        if isinstance(r, Exception):
+            raise r
+        return list(r)
+
+    def download(self, item_id, dest):
+        Path(dest).write_bytes(b"x")
+        return 1
+
+
+@pytest.fixture(autouse=True)
+def _plenty_of_space(monkeypatch):
+    monkeypatch.setattr("pireplace.sync.default_free_bytes", lambda p: BIG)
+
+
+def test_run_sync_rescans_only_when_changed(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    client = FakeClient([T("a")])
+    calls = []
+    assert run_sync(cfg, jf, client, lambda: calls.append(1) or True) == 0
+    assert calls == [1]
+    assert run_sync(cfg, jf, client, lambda: calls.append(1) or True) == 0
+    assert calls == [1]
+
+
+def test_run_sync_exit_1_when_any_mood_errors(tmp_path, caplog):
+    cfg = _config(tmp_path)
+    jf = JellyfinConfig("http://x", "u" * 32, tmp_path / "k", {"bad": "1" * 32, "good": "2" * 32})
+    client = PerMood({"1" * 32: JellyfinError("down"), "2" * 32: [T("a")]})
+    calls = []
+    with caplog.at_level(logging.INFO):
+        assert run_sync(cfg, jf, client, lambda: calls.append(1) or True) == 1
+    assert list((tmp_path / "music" / "good").glob("*.flac"))
+    assert calls == [1]
+    assert "mood=bad added=0 removed=0 failed=0 error=cannot list playlist: down" in caplog.text
+    assert "mood=good added=1 removed=0 failed=0" in caplog.text
+    assert caplog.text.index("mood=bad") < caplog.text.index("mood=good")
+
+
+def test_run_sync_rescan_failure_still_exit_0(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    assert run_sync(cfg, jf, FakeClient([T("a")]), lambda: False) == 0
+
+
+class _Rescan(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        type(self).seen.append((self.path, dict(self.headers.items()), self.rfile.read(n)))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def rescan_server():
+    handler = type("H", (_Rescan,), {"seen": []})
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05})
+    t.start()
+    yield server.server_address[1], handler.seen
+    server.shutdown()
+    server.server_close()
+    t.join()
+
+
+def test_trigger_rescan_sends_required_headers(rescan_server):
+    port, seen = rescan_server
+    assert trigger_rescan(port) is True
+    path, headers, body = seen[0]
+    assert path == "/api/rescan"
+    assert headers["Host"] == "pireplace.local"
+    assert headers["Content-Type"] == "application/json"
+    assert body == b"{}"
+
+
+def test_trigger_rescan_unreachable_returns_false(caplog):
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    with caplog.at_level(logging.WARNING):
+        assert trigger_rescan(port, timeout=1.0) is False
+    assert "rescan" in caplog.text

@@ -7,14 +7,19 @@ bare filename resolved inside the mood dir; anything else in the folder
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from pireplace.config import Config, JellyfinConfig
 from pireplace.jellyfin import JellyfinError, Track
+
+log = logging.getLogger("pireplace.sync")
 
 MANIFEST = ".pireplace-sync.json"
 MIN_FREE_START = 2 * 1024**3
@@ -179,3 +184,38 @@ def sync_mood(
     if result.failed:
         result.error = f"{result.failed} downloads failed"
     return result
+
+
+def trigger_rescan(port: int, timeout: float = 10.0) -> bool:
+    """Ask the local control API to rescan the media dirs. False (and a warning) on any error."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/rescan",
+        data=b"{}",
+        method="POST",
+        headers={"Host": "pireplace.local", "Content-Type": "application/json"},
+    )
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback: never via a proxy
+        with opener.open(req, timeout=timeout) as resp:
+            resp.read()
+        return True
+    except Exception as e:  # URLError, HTTPError, timeouts, resets: all just a warning
+        log.warning("rescan failed: %s", e)
+        return False
+
+
+def run_sync(config: Config, jf: JellyfinConfig, client, rescan: Callable[[], bool]) -> int:
+    """Sync every configured mood; rescan once if anything changed. 0 ok, 1 if any mood errored."""
+    changed = False
+    failed = False
+    for mood, playlist_id in jf.playlists.items():
+        result = sync_mood(client, mood, playlist_id, config.music_dir / mood, free_bytes=default_free_bytes)
+        line = f"mood={mood} added={result.added} removed={result.removed} failed={result.failed}"
+        if result.error:
+            line += f" error={result.error}"
+            failed = True
+        log.info("%s", line)
+        changed = changed or bool(result.added or result.removed)
+    if changed and not rescan():
+        log.warning("rescan did not succeed; new music appears after the next rescan")
+    return 1 if failed else 0
