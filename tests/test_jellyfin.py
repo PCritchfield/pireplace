@@ -1,9 +1,11 @@
+import logging
 import socket
+from urllib.parse import parse_qs, urlsplit
 import time
 
 import pytest
 
-from pireplace.jellyfin import JellyfinClient, JellyfinError, Track
+from pireplace.jellyfin import JellyfinClient, JellyfinError, Track, TrackList
 from tests.fake_jellyfin import FakeJellyfin
 
 USER = "u" * 32
@@ -156,3 +158,47 @@ def test_trickling_download_hits_the_per_file_deadline(fake, tmp_path):
 
 def test_default_download_deadline_is_fifteen_minutes(fake):
     assert client(fake)._download_deadline == 15 * 60
+
+
+def test_list_asks_for_media_sources(fake):
+    fake.playlists[PL] = [item("a" * 32, "A", "T", "flac", 1)]
+    client(fake).playlist_tracks(PL)
+    query = parse_qs(urlsplit(fake.requests[-1][0]).query)
+    assert query["fields"] == ["MediaSources"] and query["userId"] == [USER]
+
+
+def test_items_without_a_valid_id_are_skipped_and_counted(fake, caplog):
+    fake.playlists[PL] = [
+        item("a" * 32, "A", "Good", "flac", 1),
+        item("../../etc/passwd", "B", "Bad", "flac", 1),
+        item("b" * 31, "C", "Short", "flac", 1),
+        {"Name": "No Id"},
+        {"Id": 12345, "Name": "Numeric"},
+    ]
+    with caplog.at_level(logging.WARNING):
+        tracks = client(fake).playlist_tracks(PL)
+    assert [t.id for t in tracks] == ["a" * 32]
+    assert isinstance(tracks, TrackList) and tracks.skipped == 4
+    assert caplog.text.count("invalid Id") == 4
+
+
+def test_download_is_fsynced_before_returning(fake, tmp_path, monkeypatch):
+    import pireplace.jellyfin as jf
+
+    synced = []
+    real = jf.os.fsync
+    monkeypatch.setattr(jf.os, "fsync", lambda fd: synced.append(fd) or real(fd))
+    fake.files["a" * 32] = b"x" * 10
+    client(fake).download("a" * 32, tmp_path / ".part")
+    assert len(synced) == 1
+
+
+def test_download_never_writes_through_an_existing_symlink(fake, tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    dest = tmp_path / ".part"
+    dest.symlink_to(victim)
+    fake.files["a" * 32] = b"x" * 10
+    with pytest.raises(JellyfinError):
+        client(fake).download("a" * 32, dest)
+    assert victim.read_text() == "keep"

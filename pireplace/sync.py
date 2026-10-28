@@ -11,8 +11,10 @@ import logging
 import os
 import re
 import shutil
+import unicodedata
 import urllib.request
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,8 +28,11 @@ RESCAN_PENDING = ".pireplace-rescan-pending"  # in the music dir; hidden, so nev
 MIN_FREE_START = 2 * 1024**3
 MIN_FREE_RUN = 1024**3
 MAX_NAME_BYTES = 200
+MAX_EXT_BYTES = 16
 
 _BAD_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f\x7f]')
+# The tail of a name track_filename() makes: " [<8 chars of the Id>].<ext>".
+_SYNCED_NAME = re.compile(r" \[[^\]]{1,8}\]\.[^.]+$")
 
 
 def default_free_bytes(path: Path) -> int:
@@ -39,12 +44,17 @@ class MoodResult:
     mood: str
     added: int = 0
     removed: int = 0
-    failed: int = 0
+    failed: int = 0  # downloads
     error: str | None = None
+    delete_failed: int = 0
+    skipped: int = 0  # playlist items without a valid Jellyfin Id
 
 
 def _clean(text: str | None, default: str) -> str:
-    cleaned = _BAD_CHARS.sub("_", text or "").lstrip(". ")
+    # Format characters (Unicode Cf: bidi overrides, zero-width marks) are dropped so a
+    # name cannot display as something else.
+    text = "".join(ch for ch in (text or "") if unicodedata.category(ch) != "Cf")
+    cleaned = _BAD_CHARS.sub("_", text).lstrip(". ")
     return cleaned or default
 
 
@@ -53,12 +63,12 @@ def _truncate(text: str, max_bytes: int) -> str:
 
 
 def track_filename(track: Track) -> str:
-    """``<Artist> - <Title> [<id[:8]>].<ext>``, always a bare, non-hidden filename."""
+    """``<Artist> - <Title> [<id[:8]>].<ext>``: a bare, non-hidden name of at most 200 bytes."""
     artist = _clean(track.artist, "Unknown Artist")
     title = _clean(track.title, "Untitled")
     # The id comes from the server unvalidated: same rules, and no dots in the extension.
     ident = _clean(str(track.id)[:8], "unknown")
-    ext = _clean((track.container or "").replace(".", "_"), "audio")
+    ext = _truncate(_clean((track.container or "").replace(".", "_"), "audio"), MAX_EXT_BYTES) or "audio"
     fixed = f" -   [{ident}].{ext}"
     budget = MAX_NAME_BYTES - len(fixed.encode("utf-8"))
     artist = _truncate(artist, budget // 2)
@@ -78,17 +88,42 @@ def _is_safe_name(name: object) -> bool:
     )
 
 
-def _load_manifest(mood_dir: Path) -> tuple[dict[str, str], bool]:
-    """Return (items, dirty). Unsafe entries are dropped (never deleted)."""
+def _load_manifest(mood_dir: Path) -> tuple[dict[str, str], bool, str | None]:
+    """Return (items, dirty, problem); problem is "missing", "corrupt" or None.
+
+    Unsafe entries are dropped (never deleted). A manifest that exists but cannot be
+    read raises OSError: guessing it empty would orphan every synced file.
+    """
     try:
-        raw = json.loads((mood_dir / MANIFEST).read_text(encoding="utf-8"))
-        items = raw["items"]
+        text = (mood_dir / MANIFEST).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, False, "missing"
+    except UnicodeDecodeError:
+        return {}, False, "corrupt"
+    try:
+        items = json.loads(text)["items"]
         if not isinstance(items, dict):
-            return {}, False
-    except (OSError, ValueError, KeyError, TypeError):
-        return {}, False
+            raise TypeError
+    except (ValueError, KeyError, TypeError):
+        return {}, False, "corrupt"
     clean = {k: v for k, v in items.items() if isinstance(k, str) and _is_safe_name(v)}
-    return clean, len(clean) != len(items)
+    return clean, len(clean) != len(items), None
+
+
+def _warn_if_ownership_reset(mood: str, mood_dir: Path, problem: str | None) -> None:
+    """A lost manifest means the sync no longer knows which files it owns."""
+    if problem == "corrupt":
+        why = "the manifest is corrupt"
+    elif problem == "missing" and any(
+        _SYNCED_NAME.search(p.name) for p in mood_dir.iterdir() if not p.name.startswith(".")
+    ):
+        why = "the manifest is missing but synced files are present"
+    else:
+        return
+    log.warning(
+        "mood=%s: %s; ownership reset: files still in the playlist are adopted again by "
+        "name, any others are left alone and never deleted", mood, why,
+    )
 
 
 def _write_manifest(mood_dir: Path, items: dict[str, str]) -> None:
@@ -107,19 +142,29 @@ def sync_mood(
     mood_dir: Path,
     free_bytes: Callable[[Path], int] = default_free_bytes,
 ) -> MoodResult:
-    result = MoodResult(mood=mood, added=0, removed=0, failed=0, error=None)
-    mood_dir = Path(mood_dir)
+    """Sync one mood. Any error, filesystem ones included, ends up in ``.error``."""
+    result = MoodResult(mood=mood)
+    try:
+        _sync_mood(client, mood, playlist_id, Path(mood_dir), free_bytes, result)
+    except OSError as e:
+        result.error = f"filesystem error: {e}"
+    return result
+
+
+def _sync_mood(client, mood: str, playlist_id: str, mood_dir: Path, free_bytes, result: MoodResult) -> None:
     mood_dir.mkdir(parents=True, exist_ok=True)
-    manifest, changed = _load_manifest(mood_dir)
+    manifest, changed, problem = _load_manifest(mood_dir)
+    _warn_if_ownership_reset(mood, mood_dir, problem)
 
     try:
         listed = client.playlist_tracks(playlist_id)
     except JellyfinError as e:
         result.error = f"cannot list playlist: {e}"
-        return result
+        return
+    result.skipped = getattr(listed, "skipped", 0)
     if not listed and manifest:
         result.error = "playlist is empty; refusing to delete synced tracks"
-        return result
+        return
 
     tracks: dict[str, Track] = {}
     for t in listed:
@@ -133,18 +178,45 @@ def sync_mood(
             continue
         name = track_filename(t)
         path = mood_dir / name
-        if path.is_file() and not path.is_symlink():
+        # A file already at the name (a crashed run, a lost manifest) is adopted unless
+        # Jellyfin says it should be a different size; then it is downloaded again.
+        if path.is_file() and not path.is_symlink() and t.size in (None, path.stat().st_size):
             adopted[t.id] = name
         else:
             to_fetch.append((t, name))
 
+    # J4: with nothing to fetch there is no space check. Deleting only frees space, so a
+    # run that only deletes or adopts cannot fill the card.
     needed = sum(t.size or 0 for t, _ in to_fetch)
     if to_fetch and needed + MIN_FREE_START > free_bytes(mood_dir):
         result.error = "not enough space for downloads; nothing changed"
-        return result
+        return
 
     manifest.update(adopted)
     result.added += len(adopted)
+
+    # J8: download first, then delete, so a run cut short never leaves a mood with
+    # fewer tracks than it had.
+    for index, (t, name) in enumerate(to_fetch):
+        if free_bytes(mood_dir) - (t.size or 0) < MIN_FREE_RUN:
+            left = len(to_fetch) - index
+            result.failed += left
+            log.warning("mood=%s: free space would drop below 1 GB; %d downloads left for later", mood, left)
+            break
+        part = mood_dir / f".{name}.part"
+        try:
+            part.unlink(missing_ok=True)  # a stale (or planted symlink) .part is never written through
+            client.download(t.id, part)
+            os.replace(part, mood_dir / name)
+        except (JellyfinError, OSError) as e:
+            with suppress(OSError):
+                part.unlink(missing_ok=True)
+            result.failed += 1
+            log.warning("mood=%s item=%s: %s", mood, t.id, e)
+            continue
+        manifest[t.id] = name
+        result.added += 1
+        log.info("mood=%s downloaded %s", mood, name)
 
     # Delete only manifest-recorded bare filenames, and never one still in use.
     keep = {manifest[i] for i in manifest if i not in to_delete} | {n for _, n in to_fetch}
@@ -155,36 +227,28 @@ def sync_mood(
                 continue
             try:
                 path.unlink(missing_ok=True)
-            except OSError:
-                result.failed += 1
+            except OSError as e:
+                result.delete_failed += 1
+                log.warning("mood=%s item=%s: cannot delete %s: %s", mood, item_id, name, e)
                 continue
         del manifest[item_id]
         result.removed += 1
-
-    for index, (t, name) in enumerate(to_fetch):
-        if free_bytes(mood_dir) - (t.size or 0) < MIN_FREE_RUN:
-            result.failed += len(to_fetch) - index
-            break
-        part = mood_dir / f".{name}.part"
-        try:
-            client.download(t.id, part)
-            os.replace(part, mood_dir / name)
-        except (JellyfinError, OSError):
-            part.unlink(missing_ok=True)
-            result.failed += 1
-            continue
-        manifest[t.id] = name
-        result.added += 1
 
     if changed or result.added or result.removed:
         try:
             _write_manifest(mood_dir, manifest)
         except OSError:
             result.error = "cannot write manifest"
-            return result
+            return
+    problems = []
     if result.failed:
-        result.error = f"{result.failed} downloads failed"
-    return result
+        problems.append(f"{result.failed} downloads failed")
+    if result.delete_failed:
+        problems.append(f"{result.delete_failed} deletes failed")
+    if result.skipped:
+        problems.append(f"{result.skipped} playlist items skipped (invalid Id)")
+    if problems:
+        result.error = "; ".join(problems)
 
 
 def _local(port: int, path: str, timeout: float, data: bytes | None = None) -> bytes:
@@ -263,7 +327,10 @@ def run_sync(
     failed = False
     for mood, playlist_id in jf.playlists.items():
         result = sync_mood(client, mood, playlist_id, config.music_dir / mood, free_bytes=default_free_bytes)
-        line = f"mood={mood} added={result.added} removed={result.removed} failed={result.failed}"
+        line = (
+            f"mood={mood} added={result.added} removed={result.removed} failed={result.failed}"
+            f" delete_failed={result.delete_failed} skipped={result.skipped}"
+        )
         if result.error:
             line += f" error={result.error}"
             failed = True

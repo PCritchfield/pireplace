@@ -151,13 +151,13 @@ def test_existing_file_at_target_name_is_adopted(tmp_path):
     a = T("a")
     (tmp_path / "modern").mkdir()
     (tmp_path / "modern" / MANIFEST).write_text("{corrupt")
-    (tmp_path / "modern" / track_filename(a)).write_bytes(b"already")
+    (tmp_path / "modern" / track_filename(a)).write_bytes(b"already!!!")  # a.size == 10
     c = FakeClient([a])
     res = run(c, tmp_path)
     assert c.downloads == []
     assert res.error is None
     assert set(manifest(tmp_path)) == {a.id}
-    assert (tmp_path / "modern" / track_filename(a)).read_bytes() == b"already"
+    assert (tmp_path / "modern" / track_filename(a)).read_bytes() == b"already!!!"
 
 
 def test_space_check_refuses_before_any_change(tmp_path):
@@ -330,7 +330,8 @@ def test_run_sync_exit_1_when_any_mood_errors(tmp_path, caplog):
         assert run_sync(cfg, jf, client, lambda: calls.append(1) or True, idle) == 1
     assert list((tmp_path / "music" / "good").glob("*.flac"))
     assert calls == [1]
-    assert "mood=bad added=0 removed=0 failed=0 error=cannot list playlist: down" in caplog.text
+    assert ("mood=bad added=0 removed=0 failed=0 delete_failed=0 skipped=0 "
+            "error=cannot list playlist: down") in caplog.text
     assert "mood=good added=1 removed=0 failed=0" in caplog.text
     assert caplog.text.index("mood=bad") < caplog.text.index("mood=good")
 
@@ -524,3 +525,175 @@ def test_unwritable_marker_is_only_a_warning(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         assert run_sync(cfg, jf, FakeClient([T("a")]), c.rescan, c.playing) == 0
     assert "pending" in caplog.text
+
+
+# --- download before delete, isolation, logging (final review) ---------------------
+
+
+class Recording(FakeClient):
+    """Notes which files were in the mood dir when each download started."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.present_at_download = []
+
+    def download(self, item_id, dest):
+        self.present_at_download.append(sorted(p.name for p in Path(dest).parent.iterdir()))
+        return super().download(item_id, dest)
+
+
+def test_downloads_happen_before_deletes(tmp_path):
+    old, new = T("a"), T("b")
+    run(FakeClient([old]), tmp_path)
+    c = Recording([new])
+    res = run(c, tmp_path)
+    assert (res.added, res.removed) == (1, 1)
+    assert track_filename(old) in c.present_at_download[0]
+    assert files(tmp_path) == [track_filename(new)]
+
+
+def test_deletes_still_happen_when_a_download_fails(tmp_path):
+    old, new = T("a"), T("b")
+    run(FakeClient([old]), tmp_path)
+    res = run(FakeClient([new], fail_ids=[new.id]), tmp_path)
+    assert (res.added, res.removed, res.failed) == (0, 1, 1)
+    assert files(tmp_path) == []
+
+
+def test_mkdir_error_is_a_mood_error(tmp_path):
+    (tmp_path / "modern").write_text("a file where the folder should be")
+    res = run(FakeClient([T("a")]), tmp_path)
+    assert res.error and "filesystem error" in res.error
+
+
+def test_free_space_error_is_a_mood_error(tmp_path):
+    def broken(p):
+        raise OSError("statvfs failed")
+
+    res = run(FakeClient([T("a")]), tmp_path, free=broken)
+    assert res.error and "statvfs failed" in res.error
+
+
+def test_one_broken_mood_does_not_stop_the_others(tmp_path):
+    cfg = _config(tmp_path)
+    (tmp_path / "music").mkdir()
+    (tmp_path / "music" / "bad").write_text("not a folder")
+    jf = JellyfinConfig("http://x", "u" * 32, tmp_path / "k", {"bad": "1" * 32, "good": "2" * 32})
+    client = PerMood({"1" * 32: [T("a")], "2" * 32: [T("b")]})
+    assert run_sync(cfg, jf, client, lambda: True, idle) == 1
+    assert list((tmp_path / "music" / "good").glob("*.flac"))
+
+
+def test_each_failure_and_download_is_logged(tmp_path, caplog):
+    a, b = T("a"), T("b")
+    with caplog.at_level(logging.INFO):
+        run(FakeClient([a, b], fail_ids=[b.id]), tmp_path)
+    assert f"mood=modern item={b.id}: boom" in caplog.text
+    assert f"mood=modern downloaded {track_filename(a)}" in caplog.text
+
+
+def test_delete_failures_are_counted_apart_from_download_failures(tmp_path, monkeypatch, caplog):
+    a, b = T("a"), T("b")
+    run(FakeClient([a, b]), tmp_path)
+    real_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self.name == track_filename(b):
+            raise PermissionError("busy")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with caplog.at_level(logging.WARNING):
+        res = run(FakeClient([a]), tmp_path)
+    assert (res.removed, res.failed, res.delete_failed) == (0, 0, 1)
+    assert res.error == "1 deletes failed"
+    assert f"mood=modern item={b.id}: cannot delete" in caplog.text
+    assert b.id in manifest(tmp_path)  # still owned: retried next run
+
+
+def test_skipped_playlist_items_make_the_mood_an_error(tmp_path):
+    class Skipping(FakeClient):
+        def playlist_tracks(self, playlist_id):
+            from pireplace.jellyfin import TrackList
+
+            tracks = TrackList(super().playlist_tracks(playlist_id))
+            tracks.skipped = 2
+            return tracks
+
+    res = run(Skipping([T("a")]), tmp_path)
+    assert res.added == 1 and res.skipped == 2
+    assert res.error == "2 playlist items skipped (invalid Id)"
+
+
+def test_existing_file_of_the_wrong_size_is_downloaded_again(tmp_path):
+    a = T("a", size=13)  # FakeClient writes b"data-aaaaaaaa", 13 bytes
+    (tmp_path / "modern").mkdir()
+    (tmp_path / "modern" / track_filename(a)).write_bytes(b"half")
+    c = FakeClient([a])
+    res = run(c, tmp_path)
+    assert c.downloads == [a.id] and res.added == 1
+    assert (tmp_path / "modern" / track_filename(a)).read_bytes() == b"data-aaaaaaaa"
+
+
+def test_stale_part_symlink_is_never_written_through(tmp_path):
+    a = T("a")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    (tmp_path / "modern").mkdir()
+    (tmp_path / "modern" / f".{track_filename(a)}.part").symlink_to(victim)
+    res = run(FakeClient([a]), tmp_path)
+    assert res.added == 1 and victim.read_text() == "keep"
+
+
+def test_long_extension_is_capped_and_name_fits():
+    name = track_filename(Track("a" * 32, "A" * 300, "T" * 300, "x" * 500, 1))
+    assert len(name.encode()) <= 200
+    ext = name.rsplit(".", 1)[1]
+    assert 0 < len(ext.encode()) <= 16
+    assert name.startswith("A") and " - T" in name
+
+
+def test_bidi_and_format_characters_are_stripped():
+    name = track_filename(Track("a" * 32, "Evil\u202eArtist", "Zero\u200bWidth\ufeff", "fl\u2066ac", 1))
+    assert name == "EvilArtist - ZeroWidth [aaaaaaaa].flac"
+
+
+def test_corrupt_manifest_with_files_warns_ownership_reset(tmp_path, caplog):
+    a = T("a")
+    run(FakeClient([a]), tmp_path)
+    (tmp_path / "modern" / MANIFEST).write_text("{corrupt")
+    with caplog.at_level(logging.WARNING):
+        run(FakeClient([a]), tmp_path)
+    assert "ownership reset" in caplog.text
+
+
+def test_missing_manifest_with_synced_files_warns_ownership_reset(tmp_path, caplog):
+    a = T("a")
+    run(FakeClient([a]), tmp_path)
+    (tmp_path / "modern" / MANIFEST).unlink()
+    with caplog.at_level(logging.WARNING):
+        run(FakeClient([a]), tmp_path)
+    assert "ownership reset" in caplog.text
+
+
+def test_missing_manifest_with_only_manual_files_is_quiet(tmp_path, caplog):
+    (tmp_path / "modern").mkdir()
+    (tmp_path / "modern" / "my rip.flac").write_bytes(b"x")
+    with caplog.at_level(logging.WARNING):
+        run(FakeClient([]), tmp_path)
+    assert "ownership reset" not in caplog.text
+
+
+def test_unreadable_manifest_is_a_mood_error_not_a_reset(tmp_path, monkeypatch):
+    a = T("a")
+    run(FakeClient([a]), tmp_path)
+    real = Path.read_text
+
+    def read_text(self, *args, **kw):
+        if self.name == MANIFEST:
+            raise PermissionError("denied")
+        return real(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    res = run(FakeClient([]), tmp_path)
+    assert res.error and "denied" in res.error

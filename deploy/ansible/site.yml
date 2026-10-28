@@ -75,7 +75,8 @@
     # on), pireplace_jellyfin_url, pireplace_jellyfin_user_id, pireplace_jellyfin_playlists
     # and pireplace_tailscale_authkey. Play vars outrank inventory vars, so the defaults
     # live in the pireplace_jf_* names and an inventory override is read through them.
-    pireplace_jf_enabled: "{{ (pireplace_jellyfin_api_key | default('') | string | length) > 0 }}"
+    # The one test for "sync on": a token that is set, not null and not only whitespace.
+    pireplace_jf_enabled: "{{ (pireplace_jellyfin_api_key | default('', true) | string | trim | length) > 0 }}"
     pireplace_jf_url: "{{ pireplace_jellyfin_url | default('http://100.88.8.6:8096') }}"
     # The sync unit may only reach this address (IPAddressAllow drop-in), so the URL
     # must name the server by its Tailscale IPv4 address.
@@ -418,7 +419,7 @@
     - name: Install the Jellyfin access token file
       ansible.builtin.copy:
         dest: /etc/pireplace/jellyfin.key
-        content: "{{ pireplace_jellyfin_api_key }}\n"
+        content: "{{ pireplace_jellyfin_api_key | string | trim }}\n"
         owner: root
         group: root
         mode: "0600"

@@ -524,10 +524,13 @@ def test_tailscale_join_failure_explains_and_still_removes_the_key(tmp_path):
     assert "SECRET" not in failed.stdout + failed.stderr
 
 
-def _render_config(extra: dict, directory: Path) -> Path:
+def _templar(extra: dict):
     pytest.importorskip("ansible")
-    from ansible.parsing.dataloader import DataLoader
-    from ansible.template import Templar, trust_as_template
+    try:
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.template import Templar, trust_as_template
+    except ImportError:  # trust_as_template is ansible-core 2.19+
+        pytest.skip("ansible-core too old for trust_as_template")
 
     # Values read with yaml.safe_load are untrusted; mark the play vars as templates.
     play_vars = {
@@ -535,7 +538,11 @@ def _render_config(extra: dict, directory: Path) -> Path:
         for k, v in yaml.safe_load(SITE)[1]["vars"].items()
     }
     play_vars.update(hotspot_password="a-test-password", **extra)
-    templar = Templar(loader=DataLoader(), variables=play_vars)
+    return Templar(loader=DataLoader(), variables=play_vars), trust_as_template
+
+
+def _render_config(extra: dict, directory: Path) -> Path:
+    templar, trust_as_template = _templar(extra)
     text = (ROOT / "deploy" / "ansible" / "templates" / "config.toml.j2").read_text()
     out = directory / "etc" / "config.toml"
     out.parent.mkdir(exist_ok=True)
@@ -623,3 +630,113 @@ def test_sync_service_retries_a_failed_night_but_not_a_config_error():
     assert unit_section["Wants"] == ["network-online.target"]
     after = unit_section["After"][0].split()
     assert "network-online.target" in after and "tailscaled.service" in after
+
+
+def test_enabled_check_is_one_expression_used_by_the_template():
+    play = yaml.safe_load(SITE)[1]
+    assert play["vars"]["pireplace_jf_enabled"] == (
+        "{{ (pireplace_jellyfin_api_key | default('', true) | string | trim | length) > 0 }}")
+    template = (ROOT / "deploy" / "ansible" / "templates" / "config.toml.j2").read_text()
+    assert "{% if pireplace_jf_enabled | bool %}" in template
+    assert "pireplace_jellyfin_api_key" not in template
+
+
+def test_whitespace_or_null_token_means_disabled(tmp_path):
+    import tomllib
+
+    for n, token in enumerate(("   ", None)):
+        directory = tmp_path / f"t{n}"
+        directory.mkdir()
+        plain = _render_config({"pireplace_jellyfin_api_key": token}, directory)
+        assert "jellyfin" not in tomllib.loads(plain.read_text())
+
+
+def test_inventory_overrides_reach_the_template(tmp_path):
+    from pireplace.config import load_jellyfin_config
+
+    rendered = _render_config({
+        "pireplace_jellyfin_api_key": "tok",
+        "pireplace_jellyfin_url": "http://100.64.1.2:8096",
+        "pireplace_jellyfin_user_id": "c" * 32,
+        "pireplace_jellyfin_playlists": {"christmas": "d" * 32},
+    }, tmp_path)
+    cfg = load_jellyfin_config(rendered)
+    assert cfg.url == "http://100.64.1.2:8096"
+    assert cfg.user_id == "c" * 32
+    assert cfg.playlists == {"christmas": "d" * 32}
+
+
+def test_dropin_host_comes_from_the_url():
+    templar, trust = _templar({"pireplace_jellyfin_url": "http://100.64.1.2:8096"})
+    assert templar.template(trust("{{ pireplace_jf_host }}")) == "100.64.1.2"
+    templar, trust = _templar({})
+    assert templar.template(trust("{{ pireplace_jf_host }}")) == "100.88.8.6"
+
+
+def _run_copy_tasks(tmp_path: Path, names: list[str], extra_vars: dict) -> list[str]:
+    """Run the named copy tasks locally (dest moved into tmp_path) twice; return stdouts."""
+    ansible = Path(sys.executable).with_name("ansible-playbook")
+    if not ansible.exists():
+        pytest.skip("ansible-playbook not installed")
+    play = yaml.safe_load(SITE)[1]
+    tasks = []
+    for name in names:
+        task = dict(_task(name))
+        copy = {k: v for k, v in task["ansible.builtin.copy"].items() if k not in ("owner", "group")}
+        copy["dest"] = str(tmp_path / Path(copy["dest"]).name)
+        task["ansible.builtin.copy"] = copy
+        task.pop("notify", None)
+        task.pop("when", None)
+        tasks.append(task)
+    variables = {**play["vars"], **extra_vars}
+    playbook = tmp_path / "copy.yml"
+    playbook.write_text(yaml.safe_dump([{
+        "hosts": "localhost", "connection": "local", "gather_facts": False,
+        "vars": variables, "tasks": tasks,
+    }]))
+    env = {**os.environ, "ANSIBLE_LOCALHOST_WARNING": "False", "ANSIBLE_HOME": str(tmp_path / ".ansible")}
+    return [
+        subprocess.run([str(ansible), "-i", "localhost,", str(playbook)],
+                       capture_output=True, text=True, env=env, cwd=tmp_path, check=True).stdout
+        for _ in range(2)
+    ]
+
+
+def test_dropin_and_pin_render_with_ansible_and_are_idempotent(tmp_path):
+    first, second = _run_copy_tasks(
+        tmp_path,
+        ["Allow the sync service to reach the Jellyfin server", "Pin the Tailscale repository"],
+        {"pireplace_jellyfin_api_key": "tok", "pireplace_jellyfin_url": "http://100.64.1.2:8096"},
+    )
+    assert "changed=2" in first and "changed=0" in second
+    dropin = (tmp_path / "50-jellyfin-address.conf").read_text()
+    assert "[Service]\nIPAddressAllow=100.64.1.2/32\n" in dropin
+    assert "Pin-Priority: -1" in (tmp_path / "tailscale").read_text()
+
+
+def _run_validation_play(tmp_path: Path, extra: dict) -> subprocess.CompletedProcess:
+    ansible = Path(sys.executable).with_name("ansible-playbook")
+    if not ansible.exists():
+        pytest.skip("ansible-playbook not installed")
+    play = {**yaml.safe_load(SITE)[0], "hosts": "localhost", "connection": "local"}
+    playbook = tmp_path / "validate.yml"
+    playbook.write_text(yaml.safe_dump([play]))
+    extra_vars = tmp_path / "extra.yml"
+    extra_vars.write_text(yaml.safe_dump({"hotspot_password": "a-real-password", **extra}))
+    env = {**os.environ, "ANSIBLE_LOCALHOST_WARNING": "False", "ANSIBLE_HOME": str(tmp_path / ".ansible")}
+    return subprocess.run([str(ansible), "-i", "localhost,", "-e", f"@{extra_vars}", str(playbook)],
+                          capture_output=True, text=True, env=env, cwd=tmp_path)
+
+
+@pytest.mark.parametrize("extra,ok", [
+    ({}, True),
+    ({"pireplace_jellyfin_api_key": "real-token", "pireplace_tailscale_authkey": None}, True),
+    ({"pireplace_jellyfin_api_key": "CHANGE_ME_jellyfin_access_token"}, False),
+    ({"pireplace_tailscale_authkey": " CHANGE_ME_tskey-auth-..."}, False),
+    ({"pireplace_jellyfin_user_id": "CHANGE_ME_pireplace_user_id"}, False),
+])
+def test_validation_play_refuses_placeholders(tmp_path, extra, ok):
+    result = _run_validation_play(tmp_path, extra)
+    assert (result.returncode == 0) is ok, result.stdout
+    if not ok:
+        assert "CHANGE_ME placeholder" in result.stdout
