@@ -459,6 +459,8 @@ def test_readme_uses_a_non_admin_jellyfin_user():
     assert "scripts/jellyfin_token.sh" in README
     assert "API Keys" not in README  # no admin-wide dashboard key any more
     assert "pireplace_jellyfin_user_id" in README
+    assert "music-streaming" in README
+    assert '"Users":[{"UserId":"<sync user id>","CanEdit":false}]' in README
     assert "Known limitations" in README
 
 
@@ -561,13 +563,13 @@ def test_template_renders_a_loadable_jellyfin_section_only_with_a_key(tmp_path):
     assert set(data["jellyfin"]) == {"url", "user_id", "api_key_file", "playlists"}
     cfg = load_jellyfin_config(with_key)
     assert cfg.url == "http://100.88.8.6:8096"
-    assert cfg.user_id == "1b7ed00cbdcc4a1eb624738191ca4efd"
+    assert cfg.user_id == "4640835a50a94bc69709d00d6f332fac"
     assert str(cfg.api_key_file) == "/etc/pireplace/jellyfin.key"
     assert cfg.playlists == {
-        "modern": "385d9e4b0602d3d75a00bc6d31dc5aa6",
-        "classic-swing": "dfbf231b1aaa92df17ff5248fbde6fbf",
-        "soul-motown": "352617a64fc727e324fd1bfa625cb0f6",
-        "instrumental": "a371cfe3e0f01be7542358ad2f50f7b5",
+        "modern": "dc8d8d54ecad68b2546b5c7c9b4b4766",
+        "classic-swing": "f4b96696936ec335bfeca0c623ad0669",
+        "soul-motown": "79525d419fccb3bec7c38cef5fe07b11",
+        "instrumental": "30bf4d0f66600b1d1dd8cded00e25705",
     }
 
     for n, extra in enumerate(({}, {"pireplace_jellyfin_api_key": ""})):

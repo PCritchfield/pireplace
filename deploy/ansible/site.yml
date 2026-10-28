@@ -81,13 +81,15 @@
     # The sync unit may only reach this address (IPAddressAllow drop-in), so the URL
     # must name the server by its Tailscale IPv4 address.
     pireplace_jf_host: "{{ pireplace_jf_url | urlsplit('hostname') }}"
-    pireplace_jf_user_id: "{{ pireplace_jellyfin_user_id | default('1b7ed00cbdcc4a1eb624738191ca4efd') }}"
+    # The non-admin Jellyfin user the sync reads as (music-streaming); the playlists
+    # are shared with it read-only.
+    pireplace_jf_user_id: "{{ pireplace_jellyfin_user_id | default('4640835a50a94bc69709d00d6f332fac') }}"
     pireplace_jf_playlists: "{{ pireplace_jellyfin_playlists | default(pireplace_jf_default_playlists) }}"
     pireplace_jf_default_playlists:
-      modern: 385d9e4b0602d3d75a00bc6d31dc5aa6
-      classic-swing: dfbf231b1aaa92df17ff5248fbde6fbf
-      soul-motown: 352617a64fc727e324fd1bfa625cb0f6
-      instrumental: a371cfe3e0f01be7542358ad2f50f7b5
+      modern: dc8d8d54ecad68b2546b5c7c9b4b4766
+      classic-swing: f4b96696936ec335bfeca0c623ad0669
+      soul-motown: 79525d419fccb3bec7c38cef5fe07b11
+      instrumental: 30bf4d0f66600b1d1dd8cded00e25705
     pireplace_sync_units:
       - pireplace-sync.service
       - pireplace-sync.timer

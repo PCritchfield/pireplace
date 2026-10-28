@@ -94,11 +94,15 @@ as before. Each mood folder mirrors one playlist; the sync only deletes files it
 downloaded itself, so music you rsync in is never touched.
 
 **1. Create a Jellyfin user for the Pi.** Not a dashboard API key: those act as an
-administrator. In Jellyfin, Dashboard, Users, `+`: name it `pireplace`, give it a
-password, and leave it a plain user (not an administrator). Under its Access settings
-allow only the Music library, and under Features allow media downloads. Then either
-share the four playlists with `pireplace` or make them public; the Pi reads them as
-that user.
+administrator, and cannot call the per-user playlist endpoints anyway. In Jellyfin,
+Dashboard, Users, `+`: name it (the author's is `music-streaming`), give it a password,
+and leave it a plain user (not an administrator). Under its Access settings allow only
+the Music library, and under Features allow media downloads. Then share the playlists
+with it read-only, or make them public; the Pi reads them as that user.
+
+If a playlist is ever rebuilt, create it with the share in the create call
+(`POST /Playlists` with `"Users":[{"UserId":"<sync user id>","CanEdit":false}]`):
+adding a share to an existing private playlist crashes Jellyfin 12.2.
 
 **2. Get its access token and user Id.** From a machine that can reach Jellyfin:
 
@@ -108,11 +112,11 @@ that user.
 
 It asks for the URL, the user name and the password (typed without echo; nothing goes
 on a command line) and prints `pireplace_jellyfin_api_key` (the access token) and
-`pireplace_jellyfin_user_id` (the `pireplace` user's Id). The variable keeps the name
+`pireplace_jellyfin_user_id` (that user's Id). The variable keeps the name
 `..._api_key`, but its value is this access token. `pireplace_jellyfin_user_id` must
-be the `pireplace` user's Id, not your own: the default in the playbook is the
-author's account. To revoke the token, delete the `pireplace` device in Dashboard,
-Devices.
+be the Id of the same limited user, not your own account: the default in the playbook
+is the author's `music-streaming` user. To revoke the token, delete the `pireplace`
+device in Dashboard, Devices.
 
 **3. Put the secrets in `secrets.yml` (gitignored) or the inventory.**
 
@@ -164,7 +168,8 @@ and a later run rescans once the music is paused. If the server is unreachable t
 fails cleanly and the music keeps playing; a failed run is retried every 10 minutes, up
 to 4 times, before it waits for the next night (a config error is not retried).
 
-**Add a mood.** Create a playlist in Jellyfin (shared with `pireplace` or public), then
+**Add a mood.** Create a playlist in Jellyfin (shared with the sync user in the create
+call, see step 1, or public), then
 add `name: <playlist Id>` to `pireplace_jellyfin_playlists` (keep the existing four,
 since the map replaces the default) and deploy; the folder is created and the next sync
 fills it. Mood names are lowercase letters, digits and `-`.
@@ -371,12 +376,12 @@ Run through this on the real Pi 4 and tick each item.
       message, nothing crash-loops (`sudo systemctl --user --machine=pireplace@.host status pireplace-video`
       stays stable).
 - [ ] Jellyfin over Tailscale (only if the sync is on). From the Pi, with the token and
-      the `pireplace` user's Id typed into `read -rs K` and `read -r U` (never pasted
+      the sync user's Id typed into `read -rs K` and `read -r U` (never pasted
       into chat or history; the header goes through stdin, not the command line):
-      `printf 'Authorization: MediaBrowser Token="%s"\n' "$K" | curl -s -H @- "http://100.88.8.6:8096/Playlists/385d9e4b0602d3d75a00bc6d31dc5aa6/Items?userId=$U" | head -c 300`
+      `printf 'Authorization: MediaBrowser Token="%s"\n' "$K" | curl -s -H @- "http://100.88.8.6:8096/Playlists/dc8d8d54ecad68b2546b5c7c9b4b4766/Items?userId=$U" | head -c 300`
       returns JSON with `"Items"`, and `/Items/<Id>/Download` for one of its Ids returns
-      `200` and several MB. On 401 or 403, share the four playlists with `pireplace` (or
-      make them public) and check its library access and download permission.
+      `200` and several MB. On 401 or 403, check that the four playlists are shared with
+      the sync user (or public) and that it has library access and download permission.
 - [ ] Tailnet lock-down (after step 6 of "Music from Jellyfin"). On the Pi,
       `nc -zvw3 100.88.8.6 22` fails and
       `curl -s -o /dev/null -w '%{http_code}\n' http://100.88.8.6:8096/System/Info/Public`

@@ -55,13 +55,13 @@ def test_script_prints_token_and_user_id(auth_server):
     url, seen = auth_server
     password = 'p"w \\ secret'
     out = subprocess.run(
-        ["bash", str(SCRIPT)], input=f"{url}\npireplace\n{password}\n",
+        ["bash", str(SCRIPT)], input=f"{url}\n\n{password}\n",  # empty user: the default
         capture_output=True, text=True, check=True, timeout=30,
     )
     path, headers, body = seen[0]
     assert path == "/Users/AuthenticateByName"
     assert headers["Authorization"] == AUTH
     assert headers["Content-Type"] == "application/json"
-    assert json.loads(body) == {"Username": "pireplace", "Pw": password}
+    assert json.loads(body) == {"Username": "music-streaming", "Pw": password}
     assert "tok-123" in out.stdout and "f" * 32 in out.stdout
     assert password not in out.stdout and password not in out.stderr

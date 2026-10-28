@@ -16,8 +16,8 @@ done
 read -rp "Jellyfin URL [http://100.88.8.6:8096]: " url
 url="${url:-http://100.88.8.6:8096}"
 url="${url%/}"
-read -rp "Jellyfin user [pireplace]: " user
-user="${user:-pireplace}"
+read -rp "Jellyfin user [music-streaming]: " user
+user="${user:-music-streaming}"
 read -rsp "Password for $user: " password
 echo >&2
 
