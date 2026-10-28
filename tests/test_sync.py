@@ -268,7 +268,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from pireplace.config import JellyfinConfig, load_config
-from pireplace.sync import run_sync, trigger_rescan
+from pireplace.sync import RESCAN_PENDING, music_playing, run_sync, trigger_rescan
 
 
 def _config(tmp_path, port=80):
@@ -302,6 +302,10 @@ class PerMood:
         return 1
 
 
+def idle():
+    return False
+
+
 @pytest.fixture(autouse=True)
 def _plenty_of_space(monkeypatch):
     monkeypatch.setattr("pireplace.sync.default_free_bytes", lambda p: BIG)
@@ -311,9 +315,9 @@ def test_run_sync_rescans_only_when_changed(tmp_path):
     cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
     client = FakeClient([T("a")])
     calls = []
-    assert run_sync(cfg, jf, client, lambda: calls.append(1) or True) == 0
+    assert run_sync(cfg, jf, client, lambda: calls.append(1) or True, idle) == 0
     assert calls == [1]
-    assert run_sync(cfg, jf, client, lambda: calls.append(1) or True) == 0
+    assert run_sync(cfg, jf, client, lambda: calls.append(1) or True, idle) == 0
     assert calls == [1]
 
 
@@ -323,7 +327,7 @@ def test_run_sync_exit_1_when_any_mood_errors(tmp_path, caplog):
     client = PerMood({"1" * 32: JellyfinError("down"), "2" * 32: [T("a")]})
     calls = []
     with caplog.at_level(logging.INFO):
-        assert run_sync(cfg, jf, client, lambda: calls.append(1) or True) == 1
+        assert run_sync(cfg, jf, client, lambda: calls.append(1) or True, idle) == 1
     assert list((tmp_path / "music" / "good").glob("*.flac"))
     assert calls == [1]
     assert "mood=bad added=0 removed=0 failed=0 error=cannot list playlist: down" in caplog.text
@@ -333,10 +337,19 @@ def test_run_sync_exit_1_when_any_mood_errors(tmp_path, caplog):
 
 def test_run_sync_rescan_failure_still_exit_0(tmp_path):
     cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
-    assert run_sync(cfg, jf, FakeClient([T("a")]), lambda: False) == 0
+    assert run_sync(cfg, jf, FakeClient([T("a")]), lambda: False, idle) == 0
 
 
 class _Rescan(BaseHTTPRequestHandler):
+    def do_GET(self):
+        type(self).seen.append((self.path, dict(self.headers.items()), b""))
+        body = json.dumps({"music": {"available": True, "playing": False}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         type(self).seen.append((self.path, dict(self.headers.items()), self.rfile.read(n)))
@@ -366,7 +379,7 @@ def test_trigger_rescan_sends_required_headers(rescan_server):
     assert trigger_rescan(port) is True
     path, headers, body = seen[0]
     assert path == "/api/rescan"
-    assert headers["Host"] == "pireplace.local"
+    assert headers["Host"] == f"127.0.0.1:{port}"  # urllib's own; the page accepts its address
     assert headers["Content-Type"] == "application/json"
     assert body == b"{}"
 
@@ -381,3 +394,133 @@ def test_trigger_rescan_unreachable_returns_false(caplog):
     with caplog.at_level(logging.WARNING):
         assert trigger_rescan(port, timeout=1.0) is False
     assert "rescan" in caplog.text
+
+
+# --- the real control API (pireplace.web) --------------------------------------
+
+from pireplace.web import make_server
+from tests.test_web import STUB_STATUS, StubFireplace, _start, _stop
+
+
+@pytest.fixture
+def control():
+    """A real control server that knows no host names: only its own address passes."""
+    stub = StubFireplace()
+    srv, t = _start(stub, allowed_hosts=("not-this-host.example",))
+    yield srv
+    _stop(srv, t)
+
+
+def test_trigger_rescan_is_accepted_by_the_real_control_api(control):
+    assert make_server  # the helper builds it with pireplace.web.make_server
+    assert trigger_rescan(control.port) is True
+    assert control.stub.calls == [("rescan",)]
+
+
+def test_music_playing_reads_the_real_status(control, monkeypatch):
+    assert music_playing(control.port) is True
+    paused = {**STUB_STATUS, "music": {**STUB_STATUS["music"], "playing": False}}
+    monkeypatch.setattr(control.stub, "status", lambda: paused)
+    assert music_playing(control.port) is False
+    monkeypatch.setattr(control.stub, "status", lambda: {**STUB_STATUS, "music": {"available": False}})
+    assert music_playing(control.port) is False
+
+
+def test_music_playing_is_none_when_status_cannot_be_read(control, monkeypatch, caplog):
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    with caplog.at_level(logging.WARNING):
+        assert music_playing(port, timeout=1.0) is None
+    assert "status" in caplog.text
+    monkeypatch.setattr(control.stub, "status", lambda: {"moods": []})  # no "music"
+    assert music_playing(control.port) is None
+
+
+# --- rescan deferred while music plays -----------------------------------------
+
+
+class Calls:
+    def __init__(self, playing=False, rescan_ok=True):
+        self.playing_answer = playing
+        self.rescan_ok = rescan_ok
+        self.rescans = 0
+        self.asked = 0
+
+    def rescan(self):
+        self.rescans += 1
+        return self.rescan_ok
+
+    def playing(self):
+        self.asked += 1
+        return self.playing_answer
+
+
+def _marker(tmp_path):
+    return tmp_path / "music" / RESCAN_PENDING
+
+
+def test_changed_and_idle_rescans_now(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    c = Calls(playing=False)
+    assert run_sync(cfg, jf, FakeClient([T("a")]), c.rescan, c.playing) == 0
+    assert c.rescans == 1 and not _marker(tmp_path).exists()
+
+
+@pytest.mark.parametrize("state", [True, None])
+def test_changed_while_playing_or_unknown_defers_with_a_marker(tmp_path, state, caplog):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    c = Calls(playing=state)
+    with caplog.at_level(logging.INFO):
+        assert run_sync(cfg, jf, FakeClient([T("a")]), c.rescan, c.playing) == 0
+    assert c.rescans == 0 and _marker(tmp_path).exists()
+    assert "rescan deferred" in caplog.text
+
+
+def test_pending_marker_rescans_on_a_later_run_without_changes(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    client = FakeClient([T("a")])
+    run_sync(cfg, jf, client, Calls().rescan, Calls(playing=True).playing)
+    assert _marker(tmp_path).exists()
+    c = Calls(playing=False)
+    assert run_sync(cfg, jf, client, c.rescan, c.playing) == 0  # nothing changed this run
+    assert c.rescans == 1 and not _marker(tmp_path).exists()
+
+
+def test_pending_marker_kept_while_still_playing(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    (tmp_path / "music").mkdir()
+    _marker(tmp_path).write_text("")
+    c = Calls(playing=True)
+    assert run_sync(cfg, jf, FakeClient([]), c.rescan, c.playing) == 0
+    assert c.rescans == 0 and _marker(tmp_path).exists()
+
+
+def test_nothing_changed_and_no_marker_asks_nothing(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    c = Calls()
+    assert run_sync(cfg, jf, FakeClient([]), c.rescan, c.playing) == 0
+    assert (c.asked, c.rescans) == (0, 0) and not _marker(tmp_path).exists()
+
+
+def test_failed_rescan_leaves_a_marker_for_the_next_run(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    c = Calls(playing=False, rescan_ok=False)
+    assert run_sync(cfg, jf, FakeClient([T("a")]), c.rescan, c.playing) == 0
+    assert c.rescans == 1 and _marker(tmp_path).exists()
+
+
+def test_unwritable_marker_is_only_a_warning(tmp_path, monkeypatch, caplog):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    c = Calls(playing=True)
+
+    def boom(self, *a, **k):
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(Path, "touch", boom)
+    with caplog.at_level(logging.WARNING):
+        assert run_sync(cfg, jf, FakeClient([T("a")]), c.rescan, c.playing) == 0
+    assert "pending" in caplog.text

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -19,6 +20,7 @@ class FakeJellyfin:
         self.fail: dict[str, int] = {}  # path (no query) -> status to return
         self.truncate: set[str] = set()  # item Ids: send half the bytes, full Content-Length
         self.html: set[str] = set()  # paths (no query) answering 200 with an HTML page
+        self.trickle: dict[str, float] = {}  # item Id -> seconds between 4-byte writes
         self.requests: list[tuple[str, dict]] = []  # (path with query, headers)
         self.url = ""
         self._server: _Server | None = None
@@ -63,6 +65,15 @@ class FakeJellyfin:
                     self.send_header("Content-Type", "application/octet-stream")
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
+                    if segs[1] in fake.trickle:
+                        try:
+                            for i in range(0, len(data), 4):
+                                self.wfile.write(data[i:i + 4])
+                                self.wfile.flush()
+                                time.sleep(fake.trickle[segs[1]])
+                        except OSError:  # the client gave up
+                            pass
+                        return
                     self.wfile.write(data[: len(data) // 2] if segs[1] in fake.truncate else data)
                     return
                 self._send(404)

@@ -1,4 +1,5 @@
 import socket
+import time
 
 import pytest
 
@@ -138,3 +139,20 @@ def test_environment_proxy_is_never_used(fake, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     fake.playlists[PL] = [item("a" * 32, "A", "T", "flac", 1)]
     assert [t.id for t in client(fake).playlist_tracks(PL)] == ["a" * 32]
+
+
+def test_trickling_download_hits_the_per_file_deadline(fake, tmp_path):
+    fake.files["a" * 32] = b"x" * 400
+    fake.trickle["a" * 32] = 0.02  # 4 bytes every 20 ms: about 2 s in all
+    c = JellyfinClient(fake.url, fake.key, USER, timeout=5.0, download_deadline=0.15)
+    dest = tmp_path / ".part"
+    started = time.monotonic()
+    with pytest.raises(JellyfinError) as e:
+        c.download("a" * 32, dest)
+    assert time.monotonic() - started < 1.5  # gave up mid-stream, not at the end
+    assert "took longer than" in str(e.value) and fake.key not in str(e.value)
+    assert not dest.exists()
+
+
+def test_default_download_deadline_is_fifteen_minutes(fake):
+    assert client(fake)._download_deadline == 15 * 60

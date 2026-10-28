@@ -155,10 +155,14 @@ systemctl list-timers pireplace-sync.timer
 Start it through systemd: the token is root-only, so `python -m pireplace sync` run by
 hand as `pireplace` cannot read it. The timer runs it at 04:30 (a few minutes of random
 delay; it catches up after a power cut). The first sync downloads everything and can
-take about an hour if Tailscale falls back to a relay. After a run that added or
-removed files the sync asks the control page to rescan, so new music shows up without a
-button press. If the server is unreachable the run fails cleanly and the music keeps
-playing.
+take about an hour if Tailscale falls back to a relay; a single file that takes more
+than 15 minutes is given up and retried later. After a run that added or removed files
+the sync asks the control page to rescan, so new music shows up without a button press.
+A rescan reshuffles the current mood, so while music is playing (or if the control page
+does not answer) it waits: it leaves `/srv/pireplace/music/.pireplace-rescan-pending`
+and a later run rescans once the music is paused. If the server is unreachable the run
+fails cleanly and the music keeps playing; a failed run is retried every 10 minutes, up
+to 4 times, before it waits for the next night (a config error is not retried).
 
 **Add a mood.** Create a playlist in Jellyfin (shared with `pireplace` or public), then
 add `name: <playlist Id>` to `pireplace_jellyfin_playlists` (keep the existing four,

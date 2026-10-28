@@ -277,7 +277,7 @@ def test_sync_service_is_a_hardened_oneshot_that_writes_only_the_music_dir():
     assert service["ProtectSystem"] == ["strict"] and service["ProtectHome"] == ["yes"]
     assert service["RestrictAddressFamilies"] == ["AF_INET AF_INET6 AF_UNIX"]
     assert service["Nice"] == ["10"] and service["IOSchedulingClass"] == ["idle"]
-    assert "Restart" not in service and "RestartPreventExitStatus" not in service
+    assert "Restart" not in service or service["Restart"] == ["on-failure"]
     for key, value in HARDENING.items():
         if key != "UMask":
             assert service[key] == [value], key
@@ -609,3 +609,17 @@ def test_control_page_refuses_the_tailnet():
     service = unit("pireplace-control.service")["Service"]
     assert service["IPAddressDeny"] == ["100.64.0.0/10 fd7a:115c:a1e0::/48"]
     assert "IPAddressAllow" not in service  # hotspot (10.42.0.0/24) and home LAN stay reachable
+
+
+def test_sync_service_retries_a_failed_night_but_not_a_config_error():
+    parsed = unit("pireplace-sync.service")
+    service, unit_section = parsed["Service"], parsed["Unit"]
+    assert service["Restart"] == ["on-failure"]
+    assert service["RestartSec"] == ["10min"]
+    assert service["RestartPreventExitStatus"] == ["2"]
+    assert service["TimeoutStartSec"] == ["6h"]
+    assert unit_section["StartLimitIntervalSec"] == ["6h"]
+    assert unit_section["StartLimitBurst"] == ["4"]
+    assert unit_section["Wants"] == ["network-online.target"]
+    after = unit_section["After"][0].split()
+    assert "network-online.target" in after and "tailscaled.service" in after

@@ -22,6 +22,7 @@ from pireplace.jellyfin import JellyfinError, Track
 log = logging.getLogger("pireplace.sync")
 
 MANIFEST = ".pireplace-sync.json"
+RESCAN_PENDING = ".pireplace-rescan-pending"  # in the music dir; hidden, so never a mood
 MIN_FREE_START = 2 * 1024**3
 MIN_FREE_RUN = 1024**3
 MAX_NAME_BYTES = 200
@@ -186,26 +187,78 @@ def sync_mood(
     return result
 
 
+def _local(port: int, path: str, timeout: float, data: bytes | None = None) -> bytes:
+    """One request to the local control API. Raises on any error.
+
+    No Host header of our own: urllib sends ``127.0.0.1:<port>``, and the control page
+    always accepts the address a request arrived on.
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        method="POST" if data is not None else "GET",
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback: never via a proxy
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read()
+
+
 def trigger_rescan(port: int, timeout: float = 10.0) -> bool:
     """Ask the local control API to rescan the media dirs. False (and a warning) on any error."""
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/rescan",
-        data=b"{}",
-        method="POST",
-        headers={"Host": "pireplace.local", "Content-Type": "application/json"},
-    )
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback: never via a proxy
-        with opener.open(req, timeout=timeout) as resp:
-            resp.read()
+        _local(port, "/api/rescan", timeout, data=b"{}")
         return True
     except Exception as e:  # URLError, HTTPError, timeouts, resets: all just a warning
         log.warning("rescan failed: %s", e)
         return False
 
 
-def run_sync(config: Config, jf: JellyfinConfig, client, rescan: Callable[[], bool]) -> int:
-    """Sync every configured mood; rescan once if anything changed. 0 ok, 1 if any mood errored."""
+def music_playing(port: int, timeout: float = 10.0) -> bool | None:
+    """Is music playing right now (GET /api/status)? None (and a warning) if unknown."""
+    try:
+        music = json.loads(_local(port, "/api/status", timeout))["music"]
+        return music.get("playing") is True
+    except Exception as e:  # unreachable, HTTP error, not JSON, no "music" object
+        log.warning("cannot read the control page status: %s", e)
+        return None
+
+
+def _rescan_when_quiet(music_dir: Path, changed: bool, rescan, playing) -> None:
+    """Rescan if something changed or a rescan is pending, but never under playing music.
+
+    A rescan reshuffles the current mood, so while music plays (or when that cannot be
+    told) it is deferred: a marker file asks a later run to do it.
+    """
+    marker = music_dir / RESCAN_PENDING
+    if not (changed or marker.exists()):
+        return
+    state = playing()
+    if state is False and rescan():
+        marker.unlink(missing_ok=True)
+        return
+    if state is False:
+        log.warning("rescan did not succeed; it is retried on the next run")
+    else:
+        why = "music is playing" if state else "the control page status is unknown"
+        log.info("rescan deferred (%s); the next run retries", why)
+    try:
+        marker.touch()
+    except OSError as e:
+        log.warning("cannot write the rescan-pending marker %s: %s", marker, e)
+
+
+def run_sync(
+    config: Config,
+    jf: JellyfinConfig,
+    client,
+    rescan: Callable[[], bool],
+    playing: Callable[[], bool | None],
+) -> int:
+    """Sync every configured mood, then rescan if due (see _rescan_when_quiet).
+
+    0 if every mood synced, 1 if any mood errored; rescan problems are only warnings.
+    """
     changed = False
     failed = False
     for mood, playlist_id in jf.playlists.items():
@@ -216,6 +269,5 @@ def run_sync(config: Config, jf: JellyfinConfig, client, rescan: Callable[[], bo
             failed = True
         log.info("%s", line)
         changed = changed or bool(result.added or result.removed)
-    if changed and not rescan():
-        log.warning("rescan did not succeed; new music appears after the next rescan")
+    _rescan_when_quiet(config.music_dir, changed, rescan, playing)
     return 1 if failed else 0

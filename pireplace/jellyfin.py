@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CHUNK = 1024 * 1024
+# A relay that trickles must not hold a run for hours: give up on a file after this.
+DOWNLOAD_DEADLINE = 15 * 60.0
 
 
 class JellyfinError(Exception):
@@ -68,8 +71,17 @@ def _track(raw: dict) -> Track:
 
 
 class JellyfinClient:
-    def __init__(self, url: str, api_key: str, user_id: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        api_key: str,
+        user_id: str,
+        timeout: float = 30.0,
+        download_deadline: float = DOWNLOAD_DEADLINE,
+    ) -> None:
+        """`timeout` bounds each network wait; `download_deadline` a whole file."""
         self._url = url.rstrip("/")
+        self._download_deadline = download_deadline
         self._api_key = api_key
         self._user_id = user_id
         self._timeout = timeout
@@ -119,16 +131,23 @@ class JellyfinClient:
         dest = Path(dest)
         path = f"/Items/{urllib.parse.quote(item_id, safe='')}/Download"
         written = 0
+        deadline = time.monotonic() + self._download_deadline
         resp, err = self._request(path)
         if resp is not None:
             try:
                 with closing(resp), open(dest, "wb") as out:
-                    while chunk := resp.read(CHUNK):
+                    # read1: return what has arrived, so the deadline is checked as data
+                    # trickles in rather than after a whole chunk.
+                    while chunk := resp.read1(CHUNK):
                         out.write(chunk)
                         written += len(chunk)
-                expected = resp.headers.get("Content-Length")
-                if expected is not None and int(expected) != written:
-                    err = f"incomplete download from {path}: got {written} of {expected} bytes"
+                        if time.monotonic() > deadline:
+                            err = f"download took longer than {self._download_deadline:g} s for {path}"
+                            break
+                if err is None:
+                    expected = resp.headers.get("Content-Length")
+                    if expected is not None and int(expected) != written:
+                        err = f"incomplete download from {path}: got {written} of {expected} bytes"
             except (OSError, http.client.HTTPException, ValueError):
                 err = f"download failed for {path}"
         if err is not None:

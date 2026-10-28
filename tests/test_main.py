@@ -184,13 +184,13 @@ def _item(i, title):
 
 
 def test_sync_cli_end_to_end_with_fake_jellyfin(tmp_path, fake, plenty_of_space, rescan_server):
-    port, seen = rescan_server
+    port, seen = rescan_server  # answers GET /api/status with music not playing
     fake.playlists[PL_ID] = [_item("c" * 32, "One")]
     fake.files["c" * 32] = b"audio"
     cfg = _write_cfg(tmp_path, url=fake.url, key=fake.key, port=port)
     assert main(["sync", "--config", str(cfg)]) == 0
     assert any((tmp_path / "music" / "modern").glob("*.flac"))
-    assert [s[0] for s in seen] == ["/api/rescan"]
+    assert [s[0] for s in seen] == ["/api/status", "/api/rescan"]
 
 
 def test_api_key_never_logged(tmp_path, fake, plenty_of_space, caplog, capsys):

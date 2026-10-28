@@ -2,11 +2,20 @@
 Description=pireplace music sync from Jellyfin
 Wants=network-online.target
 After=network-online.target tailscaled.service
+# A failed run (exit 1: server or Tailscale down, some downloads failed) is retried
+# every 10 minutes, at most 4 starts in 6 hours; then the next night's timer tries again.
+StartLimitIntervalSec=6h
+StartLimitBurst=4
 
 [Service]
-# One run per timer firing. No Restart: a failed night is retried by the next night's
-# timer (or by hand), and exit status 1 or 2 must not loop.
 Type=oneshot
+Restart=on-failure
+RestartSec=10min
+# Exit status 2 is a config error or an unreadable token; retrying cannot fix that.
+RestartPreventExitStatus=2
+# The first sync over a relay takes about an hour; never let a run hang for longer
+# than this (each file also has its own 15-minute limit).
+TimeoutStartSec=6h
 User=pireplace
 Group=pireplace
 WorkingDirectory=/opt/pireplace

@@ -15,7 +15,7 @@ from pireplace.controller import Fireplace
 from pireplace.jellyfin import JellyfinClient
 from pireplace.mpv import MpvClient
 from pireplace.state import State, StateStore
-from pireplace.sync import run_sync, trigger_rescan
+from pireplace.sync import music_playing, run_sync, trigger_rescan
 from pireplace.web import make_server
 from pireplace.wifi import (
     MAX_PSK,
@@ -152,7 +152,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"pireplace: {e}", file=sys.stderr)
         return 2
     client = JellyfinClient(jf.url, api_key, jf.user_id)
-    return run_sync(config, jf, client, lambda: trigger_rescan(config.port))
+    return run_sync(
+        config, jf, client, lambda: trigger_rescan(config.port), lambda: music_playing(config.port)
+    )
 
 
 def main(argv: list[str]) -> int:
