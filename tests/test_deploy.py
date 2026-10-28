@@ -181,8 +181,16 @@ def test_playbook_warns_about_last_console_and_disables_cloud_init():
     assert "path: /etc/cloud/cloud-init.disabled" in SITE
 
 
+def _flatten(tasks):
+    for t in tasks:
+        yield t
+        for part in ("block", "rescue", "always"):
+            yield from _flatten(t.get(part, []))
+
+
 def _tasks():
-    return [t for play in yaml.safe_load(SITE) for t in play.get("tasks", [])]
+    """Every task of every play, including those nested in blocks."""
+    return [t for play in yaml.safe_load(SITE) for t in _flatten(play.get("tasks", []))]
 
 
 def test_playbook_installs_hdmi_sink_dropin_for_the_pireplace_user():
@@ -334,19 +342,186 @@ def test_tailscale_matches_the_hand_installed_state():
     assert SITE.count("sources.list.d/tailscale") == 1  # never a second source file
 
 
-def test_tailscale_up_is_secret_and_only_runs_when_not_running():
-    state = _task("Read the Tailscale login state")
-    assert "BackendState" in str(state["ansible.builtin.set_fact"])
-    up = _task("Join the tailnet")
-    assert up["no_log"] is True
+def _ts_block():
+    play = yaml.safe_load(SITE)[1]
+    return next(t for t in play["tasks"] if "block" in t and "Tailscale" in t["name"])
+
+
+def test_all_tailscale_tasks_are_one_block_gated_on_the_sync():
+    block = _ts_block()
+    assert block["when"] == "pireplace_jf_enabled"
+    inside = {t["name"] for t in _flatten(block["block"])}
+    for part in ("signing key", "apt source", "Install Tailscale", "tailscaled", "login state",
+                 "Join the tailnet", "Tell the owner", "Pin the Tailscale repository"):
+        assert any(part in name for name in inside), part
+    acting = ("command", "apt", "get_url", "lineinfile", "systemd_service", "stat", "copy", "file")
+    outside = [
+        t["name"] for t in _tasks()
+        if t["name"] not in inside and t is not block
+        and any("tailscale" in str(t.get(f"ansible.builtin.{m}", "")).lower() for m in acting)
+    ]
+    # only the unattended-upgrades origin list (harmless without the repository)
+    assert outside == ["Limit unattended-upgrades to security updates (Debian, Raspberry Pi, Tailscale)"]
+
+
+def test_tailscale_join_reads_the_key_from_a_root_only_file():
+    join = _task("Join the tailnet")
+    guard = " ".join(join["when"])
+    assert "pireplace_ts_backend_state == 'NeedsLogin'" in guard and "pireplace_ts_have_key" in guard
+    write, up = join["block"]
+    assert write["no_log"] is True and up["no_log"] is True
+    copy = write["ansible.builtin.copy"]
+    assert copy["dest"] == "{{ pireplace_ts_authkey_file }}"
+    assert copy["mode"] == "0600" and copy["owner"] == "root" and copy["group"] == "root"
+    assert yaml.safe_load(SITE)[1]["vars"]["pireplace_ts_authkey_file"].startswith("/run/")
     argv = up["ansible.builtin.command"]["argv"]
-    assert argv[:4] == ["tailscale", "up", "--hostname=pireplace", "--accept-dns=false"]
-    assert argv[4].startswith("--authkey=")
-    guard = " ".join(up["when"])
-    assert "pireplace_ts_backend_state != 'Running'" in guard and "pireplace_tailscale_authkey" in guard
-    note = _task("Tell the owner to log Tailscale in")
-    assert "sudo tailscale up --hostname=pireplace --accept-dns=false" in note["ansible.builtin.debug"]["msg"]
-    assert "pireplace_tailscale_authkey" in " ".join(note["when"])
+    assert argv == [
+        "tailscale", "up", "--hostname=pireplace", "--accept-dns=false", "--shields-up",
+        "--advertise-tags=tag:pireplace", "--timeout=60s",
+        "--auth-key=file:{{ pireplace_ts_authkey_file }}",
+    ]
+    assert "pireplace_tailscale_authkey" not in str(argv)  # never on the command line
+    fail = join["rescue"][0]["ansible.builtin.fail"]["msg"]
+    assert "auth key rejected" in fail and "{{ pireplace_ts_up_hint }}" in fail
+    hint = " ".join(yaml.safe_load(SITE)[1]["vars"]["pireplace_ts_up_hint"].split())
+    assert hint == ("sudo tailscale up --hostname=pireplace --accept-dns=false --shields-up "
+                    "--advertise-tags=tag:pireplace")
+    cleanup = join["always"][0]["ansible.builtin.file"]
+    assert cleanup == {"path": "{{ pireplace_ts_authkey_file }}", "state": "absent"}
+
+
+def test_tailscale_note_matches_the_actual_state():
+    play = yaml.safe_load(SITE)[1]
+    notes = play["vars"]["pireplace_ts_notes"]
+    assert set(notes) == {"NeedsLogin", "NeedsMachineAuth", "Stopped", "other"}
+    assert "{{ pireplace_ts_up_hint }}" in notes["NeedsLogin"]
+    assert "approve" in notes["NeedsMachineAuth"].lower()
+    assert "sudo tailscale up" in notes["Stopped"]
+    note = _task("Tell the owner what Tailscale needs")
+    assert "pireplace_ts_notes" in note["ansible.builtin.debug"]["msg"]
+    assert "pireplace_ts_backend_state != 'Running'" in " ".join(note["when"])
+
+
+def test_tailscale_updates_come_only_for_tailscale_packages():
+    assert '"origin=Tailscale,codename=${distro_codename},label=Tailscale";' in SITE
+    pin_task = _task("Pin the Tailscale repository")
+    pin = pin_task["ansible.builtin.copy"]
+    assert pin["dest"] == "/etc/apt/preferences.d/tailscale"
+    stanzas = [s.strip() for s in pin["content"].split("\n\n") if "Package:" in s]
+    assert [s for s in stanzas[0].splitlines() if not s.startswith("#")] == [
+        "Package: tailscale*", "Pin: origin pkgs.tailscale.com", "Pin-Priority: 500"]
+    assert stanzas[1].splitlines() == ["Package: *", "Pin: origin pkgs.tailscale.com", "Pin-Priority: -1"]
+    names = [t["name"] for t in _flatten(_ts_block()["block"])]
+    assert names.index(pin_task["name"]) < names.index("Install Tailscale")
+
+
+def test_playbook_refuses_placeholder_secrets():
+    play = yaml.safe_load(SITE)[0]
+    check = next(t for t in play["tasks"] if "placeholder" in t["name"])
+    that = " ".join(check["ansible.builtin.assert"]["that"])
+    assert "pireplace_jellyfin_api_key" in that and "pireplace_tailscale_authkey" in that
+    assert "CHANGE_ME" in that
+
+
+def test_inventory_example_has_no_inline_comments():
+    # Ansible's INI inventory keeps a " # ..." after a value as part of the value.
+    text = (ROOT / "deploy" / "ansible" / "inventory.example.ini").read_text()
+    for line in text.splitlines():
+        if line.startswith("#"):
+            body = line.lstrip("#").strip()
+            if body.startswith("pireplace_") and "=" in body:
+                assert "#" not in body, line
+        elif "=" in line:
+            assert "#" not in line, line
+
+
+README = (ROOT / "README.md").read_text()
+
+
+def test_readme_has_a_complete_minimal_tailnet_policy():
+    import json
+
+    block = README.split("```json\n", 1)[1].split("```", 1)[0]
+    policy = json.loads(block)
+    assert set(policy["tagOwners"]) == {"tag:pireplace", "tag:jellyfin"}
+    grants = policy["grants"]
+    assert {"src": ["tag:pireplace"], "dst": ["tag:jellyfin"], "ip": ["tcp:8096"]} in grants
+    to_pi = [g for g in grants if any(d in ("tag:pireplace", "*") for d in g["dst"])]
+    assert to_pi == [{"src": ["autogroup:member"], "dst": ["tag:pireplace"], "ip": ["tcp:22"]}]
+    assert "default allow-all" in README
+    assert "nc -zvw3 100.88.8.6 22" in README
+    assert "http://100.88.8.6:8096/System/Info/Public" in README
+    assert "curl http://100.83.117.48/" in README
+    assert "Edit ACL tags" in README
+
+
+def test_readme_uses_a_non_admin_jellyfin_user():
+    assert "scripts/jellyfin_token.sh" in README
+    assert "API Keys" not in README  # no admin-wide dashboard key any more
+    assert "pireplace_jellyfin_user_id" in README
+    assert "Known limitations" in README
+
+
+FAKE_TAILSCALE = """#!/bin/sh
+# Records argv and the auth key file's contents; exit status from $FAKE_TS_RC.
+printf '%s\\n' "$@" > "$FAKE_TS_LOG"
+for arg in "$@"; do
+    case "$arg" in --auth-key=file:*) cat "${arg#--auth-key=file:}" > "$FAKE_TS_LOG.key" ;; esac
+done
+exit "${FAKE_TS_RC:-0}"
+"""
+
+
+def _run_join(tmp_path: Path, rc: int) -> subprocess.CompletedProcess:
+    """Run the real join block locally, with a fake `tailscale` and no root-only bits."""
+    ansible = Path(sys.executable).with_name("ansible-playbook")
+    if not ansible.exists():
+        pytest.skip("ansible-playbook not installed")
+    play = yaml.safe_load(SITE)[1]
+    join = _task("Join the tailnet")
+    fake = tmp_path / "tailscale"
+    fake.write_text(FAKE_TAILSCALE)
+    fake.chmod(0o755)
+    write, up = (dict(t) for t in join["block"])
+    write["ansible.builtin.copy"] = {
+        k: v for k, v in write["ansible.builtin.copy"].items() if k not in ("owner", "group")}
+    up["ansible.builtin.command"] = {"argv": [str(fake)] + up["ansible.builtin.command"]["argv"][1:]}
+    block = {**join, "block": [write, up]}
+    keep = ("pireplace_ts_up_hint", "pireplace_ts_have_key")
+    variables = {k: play["vars"][k] for k in keep}
+    variables.update(
+        pireplace_ts_authkey_file=str(tmp_path / "authkey"),
+        pireplace_ts_backend_state="NeedsLogin",
+        pireplace_tailscale_authkey="tskey-auth-SECRET-123",
+    )
+    playbook = tmp_path / "join.yml"
+    playbook.write_text(yaml.safe_dump([{
+        "hosts": "localhost", "connection": "local", "gather_facts": False,
+        "vars": variables, "tasks": [block],
+    }]))
+    env = {**os.environ, "ANSIBLE_LOCALHOST_WARNING": "False", "ANSIBLE_HOME": str(tmp_path / ".ansible"),
+           "FAKE_TS_LOG": str(tmp_path / "ts.log"), "FAKE_TS_RC": str(rc)}
+    return subprocess.run([str(ansible), "-i", "localhost,", str(playbook)],
+                          capture_output=True, text=True, env=env, cwd=tmp_path)
+
+
+def test_tailscale_join_passes_the_key_by_file_and_removes_it(tmp_path):
+    done = _run_join(tmp_path, rc=0)
+    assert done.returncode == 0, done.stdout
+    assert (tmp_path / "ts.log.key").read_text() == "tskey-auth-SECRET-123"
+    argv = (tmp_path / "ts.log").read_text()
+    assert "SECRET" not in argv and f"--auth-key=file:{tmp_path / 'authkey'}" in argv
+    assert not (tmp_path / "authkey").exists()
+    assert "SECRET" not in done.stdout + done.stderr
+
+
+def test_tailscale_join_failure_explains_and_still_removes_the_key(tmp_path):
+    failed = _run_join(tmp_path, rc=1)
+    assert failed.returncode != 0
+    assert "auth key rejected" in failed.stdout
+    assert "sudo tailscale up --hostname=pireplace" in failed.stdout
+    assert not (tmp_path / "authkey").exists()
+    assert "SECRET" not in failed.stdout + failed.stderr
 
 
 def _render_config(extra: dict, directory: Path) -> Path:

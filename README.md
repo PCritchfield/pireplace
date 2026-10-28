@@ -88,36 +88,61 @@ ssh <user>@pireplace.local mkdir /srv/pireplace/music/christmas
 ## Music from Jellyfin
 
 The Pi can fill its mood folders from Jellyfin playlists every night, over Tailscale.
-It is optional: without `pireplace_jellyfin_api_key` nothing below is installed (the
-timer is removed if it was there) and a deploy behaves as before. Each mood folder
-mirrors one playlist; the sync only deletes files it downloaded itself, so music you
-rsync in is never touched.
+It is optional: without `pireplace_jellyfin_api_key` nothing below is installed (no
+Tailscale, no token file, the timer is removed if it was there) and a deploy behaves
+as before. Each mood folder mirrors one playlist; the sync only deletes files it
+downloaded itself, so music you rsync in is never touched.
 
-**1. Create an API key.** In Jellyfin: Dashboard, API Keys, `+`, name it `pireplace`.
-Copy the key.
+**1. Create a Jellyfin user for the Pi.** Not a dashboard API key: those act as an
+administrator. In Jellyfin, Dashboard, Users, `+`: name it `pireplace`, give it a
+password, and leave it a plain user (not an administrator). Under its Access settings
+allow only the Music library, and under Features allow media downloads. Then either
+share the four playlists with `pireplace` or make them public; the Pi reads them as
+that user.
 
-**2. Put the secrets in `secrets.yml` (gitignored) or the inventory.**
+**2. Get its access token and user Id.** From a machine that can reach Jellyfin:
+
+```sh
+./scripts/jellyfin_token.sh
+```
+
+It asks for the URL, the user name and the password (typed without echo; nothing goes
+on a command line) and prints `pireplace_jellyfin_api_key` (the access token) and
+`pireplace_jellyfin_user_id` (the `pireplace` user's Id). The variable keeps the name
+`..._api_key`, but its value is this access token. `pireplace_jellyfin_user_id` must
+be the `pireplace` user's Id, not your own: the default in the playbook is the
+author's account. To revoke the token, delete the `pireplace` device in Dashboard,
+Devices.
+
+**3. Put the secrets in `secrets.yml` (gitignored) or the inventory.**
 
 ```yaml
-pireplace_jellyfin_api_key: "paste-the-key"
+pireplace_jellyfin_api_key: "the-access-token"
+pireplace_jellyfin_user_id: "the-pireplace-user-id"
 pireplace_tailscale_authkey: "tskey-auth-..."   # only to log a new node in; see below
 ```
 
-The key is written to `/etc/pireplace/jellyfin.key` (root:pireplace, 0640), never to
-`config.toml`, logs or the sync manifest. Optional overrides (defaults are the
-author's server): `pireplace_jellyfin_url`, `pireplace_jellyfin_user_id`, and
+The token is written to `/etc/pireplace/jellyfin.key` (root:root, 0600) and handed
+to the sync service alone as a systemd credential; it is never in `config.toml`,
+logs or the sync manifest, and the control page and players cannot read it. Other
+overrides (defaults are the author's server): `pireplace_jellyfin_url` and
 `pireplace_jellyfin_playlists` (a mood-name to playlist-Id map).
 
-**3. Find the server's Tailscale IP** with `tailscale ip -4` on the Jellyfin host, or in
+**4. Find the server's Tailscale IP** with `tailscale ip -4` on the Jellyfin host, or in
 the admin console under Machines. The default `http://100.88.8.6:8096` is that address
-plus Jellyfin's port; set `pireplace_jellyfin_url` if yours differs.
+plus Jellyfin's port; set `pireplace_jellyfin_url` if yours differs. It must be the IP
+address, not a name: the sync service may connect only to that address (and to the
+Pi itself), only over the Tailscale interface.
 
-**4. Deploy.** The playbook adds the official Tailscale apt repo for your Debian
-release, installs `tailscale`, and runs `tailscale up --hostname=pireplace
---accept-dns=false` only if the node is not already logged in. With no auth key it
-prints a note instead: run `sudo tailscale up --hostname=pireplace --accept-dns=false`
-on the Pi and open the link. A Pi where Tailscale was installed by hand with the
-official script is left as it is.
+**5. Deploy.** The playbook adds the official Tailscale apt repo for your Debian
+release (pinned so it can only supply Tailscale's packages, which then get automatic
+updates), installs `tailscale`, and, only if the node needs a login and you gave an
+auth key, runs `tailscale up --hostname=pireplace --accept-dns=false --shields-up
+--advertise-tags=tag:pireplace`. The key goes through a root-only temporary file, never
+the command line. A rejected key stops the deploy with the command to run by hand.
+Without a key it prints what to do for the state Tailscale is in (log in, approve the
+machine, or bring it up). A Pi where Tailscale was installed by hand with the official
+script and is logged in is left as it is (so it keeps its old flags; see step 6).
 
 **Run it and read the log.**
 
@@ -127,33 +152,66 @@ sudo journalctl -u pireplace-sync -e
 systemctl list-timers pireplace-sync.timer
 ```
 
-The timer runs it at 04:30 (a few minutes of random delay; it catches up after a
-power cut). The first sync downloads everything and can take about an hour if
-Tailscale falls back to a relay. After a run that added or removed files the sync asks
-the control page to rescan, so new music shows up without a button press. If the
-server is unreachable the run fails cleanly and the music keeps playing.
+Start it through systemd: the token is root-only, so `python -m pireplace sync` run by
+hand as `pireplace` cannot read it. The timer runs it at 04:30 (a few minutes of random
+delay; it catches up after a power cut). The first sync downloads everything and can
+take about an hour if Tailscale falls back to a relay. After a run that added or
+removed files the sync asks the control page to rescan, so new music shows up without a
+button press. If the server is unreachable the run fails cleanly and the music keeps
+playing.
 
-**Add a mood.** Create a playlist in Jellyfin, then add `name: <playlist Id>` to
-`pireplace_jellyfin_playlists` (keep the existing four, since the map replaces the
-default) and deploy; the folder is created and the next sync fills it. Mood names are
-lowercase letters, digits and `-`.
+**Add a mood.** Create a playlist in Jellyfin (shared with `pireplace` or public), then
+add `name: <playlist Id>` to `pireplace_jellyfin_playlists` (keep the existing four,
+since the map replaces the default) and deploy; the folder is created and the next sync
+fills it. Mood names are lowercase letters, digits and `-`.
 
 **Retire a mood.** Remove it from the map and deploy. Its folder and files stay on the
 Pi, so delete them by hand (`rm -r /srv/pireplace/music/<mood>`) and press Rescan.
 
-**Tailscale key expiry.** A node key expires after 180 days by default and the Pi would
-silently lose its tailnet. In the admin console, Machines, the Pi's menu, **Disable key
-expiry**. Do this for appliances.
+**6. Lock the tailnet down (recommended).** Tailscale's default policy is a single
+allow-all rule: every device on your tailnet, including the Pi, can reach every other
+device on every port. To restrict the Pi you must replace that default allow-all rule,
+not add to it. Tags only take effect once a node carries them, so tag both machines
+first: in the admin console, Machines, each machine's menu, **Edit ACL tags**: the
+Jellyfin host (`omarchy`) gets `tag:jellyfin`, the Pi gets `tag:pireplace`. Tagged
+machines are owned by the tailnet rather than a person, and their keys do not expire,
+so the 180-day key expiry no longer applies to the Pi. A node joined by the playbook
+with an auth key asks for `tag:pireplace` itself.
 
-**Restrict the Pi (recommended).** Tag the node and let the tag reach only Jellyfin.
-This is a fragment, not a whole policy: merge it into your tailnet policy file
-(Access Controls) yourself, and tag the Pi `tag:pireplace` (an auth key created with
-that tag does it).
+Then replace the policy file (Access Controls) with this complete minimal policy (add
+grants for any other devices or services you use, such as exit nodes):
 
 ```json
-{"tagOwners": {"tag:pireplace": ["autogroup:admin"]},
- "grants": [{"src": ["tag:pireplace"], "dst": ["100.88.8.6"], "ip": ["tcp:8096"]}]}
+{
+  "tagOwners": {
+    "tag:pireplace": ["autogroup:admin"],
+    "tag:jellyfin": ["autogroup:admin"]
+  },
+  "grants": [
+    {"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"]},
+    {"src": ["autogroup:member"], "dst": ["tag:jellyfin"], "ip": ["*"]},
+    {"src": ["autogroup:member"], "dst": ["tag:pireplace"], "ip": ["tcp:22"]},
+    {"src": ["tag:pireplace"], "dst": ["tag:jellyfin"], "ip": ["tcp:8096"]}
+  ]
+}
 ```
+
+Your own devices reach each other and the Jellyfin host as before; the Pi reaches
+only Jellyfin's port 8096; nothing reaches the Pi except SSH from your own devices.
+The control page refuses tailnet addresses in any case, and with `--shields-up` the Pi
+refuses all incoming tailnet connections, SSH included (SSH over the home network still
+works). A Pi joined by hand has no shields; set them with `sudo tailscale set
+--shields-up`, or leave them down if you want SSH over the tailnet.
+
+Check it from the Pi (see also "Before the party"):
+
+```sh
+nc -zvw3 100.88.8.6 22          # must FAIL: the Pi may not reach SSH on the server
+curl -s -o /dev/null -w '%{http_code}\n' http://100.88.8.6:8096/System/Info/Public   # must print 200
+```
+
+and from another tailnet device, `curl http://100.83.117.48/` (the Pi's tailnet
+address) must fail.
 
 ## Using it
 
@@ -271,6 +329,12 @@ hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and r
 - **Deploy ends with "REBOOT REQUIRED":** the boot settings that keep console text off
   the TV changed. Run `sudo reboot` on the Pi.
 
+## Known limitations
+
+- The playbook's own variables (`pireplace_default_mood`, `pireplace_music_volume`,
+  `pireplace_log_volume`, `pireplace_start_music`, `pireplace_hdmi_card`, ...) outrank
+  the inventory, so set them with `-e` (or `-e @secrets.yml`), not in `inventory.ini`.
+
 ## Before the party
 
 Run through this on the real Pi 4 and tick each item.
@@ -302,11 +366,17 @@ Run through this on the real Pi 4 and tick each item.
 - [ ] Empty `/srv/pireplace/videos`, press Rescan: black screen, the page shows the
       message, nothing crash-loops (`sudo systemctl --user --machine=pireplace@.host status pireplace-video`
       stays stable).
-- [ ] Jellyfin over Tailscale (only if the sync is on). From the Pi, with the key typed
-      into `read -rs K` (never pasted into chat or history):
-      `curl -s -H "Authorization: MediaBrowser Token=\"$K\"" "http://100.88.8.6:8096/Playlists/385d9e4b0602d3d75a00bc6d31dc5aa6/Items?userId=1b7ed00cbdcc4a1eb624738191ca4efd" | head -c 300`
+- [ ] Jellyfin over Tailscale (only if the sync is on). From the Pi, with the token and
+      the `pireplace` user's Id typed into `read -rs K` and `read -r U` (never pasted
+      into chat or history; the header goes through stdin, not the command line):
+      `printf 'Authorization: MediaBrowser Token="%s"\n' "$K" | curl -s -H @- "http://100.88.8.6:8096/Playlists/385d9e4b0602d3d75a00bc6d31dc5aa6/Items?userId=$U" | head -c 300`
       returns JSON with `"Items"`, and `/Items/<Id>/Download` for one of its Ids returns
-      `200` and several MB. On 401 or 403, make the four playlists public in Jellyfin.
+      `200` and several MB. On 401 or 403, share the four playlists with `pireplace` (or
+      make them public) and check its library access and download permission.
+- [ ] Tailnet lock-down (after step 6 of "Music from Jellyfin"). On the Pi,
+      `nc -zvw3 100.88.8.6 22` fails and
+      `curl -s -o /dev/null -w '%{http_code}\n' http://100.88.8.6:8096/System/Info/Public`
+      prints `200`. From another tailnet device, `curl http://100.83.117.48/` fails.
 - [ ] First sync: `sudo systemctl start pireplace-sync`, then
       `sudo journalctl -u pireplace-sync -e` ends with every mood synced (allow about an
       hour over a relay).
@@ -315,4 +385,4 @@ Run through this on the real Pi 4 and tick each item.
 - [ ] A second `sudo systemctl start pireplace-sync` reports no changes and does no rescan.
 - [ ] `sudo tailscale down`, then `sudo systemctl start pireplace-sync`: it fails cleanly
       (non-zero exit, no files removed) while the music keeps playing. Then
-      `sudo tailscale up --hostname=pireplace --accept-dns=false`.
+      `sudo tailscale up`.

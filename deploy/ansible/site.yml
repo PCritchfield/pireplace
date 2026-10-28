@@ -24,6 +24,18 @@
           is the WPA2 password of the pireplace-setup hotspot and is never committed.
         quiet: true
 
+    - name: Refuse the CHANGE_ME placeholder for the Jellyfin and Tailscale settings
+      ansible.builtin.assert:
+        that:
+          - not (pireplace_jellyfin_api_key | default('', true) | string | trim).startswith('CHANGE_ME')
+          - not (pireplace_tailscale_authkey | default('', true) | string | trim).startswith('CHANGE_ME')
+          - not (pireplace_jellyfin_user_id | default('', true) | string | trim).startswith('CHANGE_ME')
+        fail_msg: >-
+          pireplace_jellyfin_api_key, pireplace_jellyfin_user_id or
+          pireplace_tailscale_authkey is still the CHANGE_ME placeholder from
+          inventory.example.ini: set the real value or remove the line.
+        quiet: true
+
 - name: Provision pireplace
   hosts: all
   become: true
@@ -78,6 +90,27 @@
     pireplace_sync_units:
       - pireplace-sync.service
       - pireplace-sync.timer
+    # Tailscale login. The auth key only passes through a root-only file on tmpfs
+    # (never argv), removed straight after `tailscale up`.
+    pireplace_ts_authkey_file: /run/pireplace-tailscale-authkey
+    pireplace_ts_have_key: "{{ (pireplace_tailscale_authkey | default('', true) | string | trim | length) > 0 }}"
+    pireplace_ts_up_hint: >-
+      sudo tailscale up --hostname=pireplace --accept-dns=false --shields-up
+      --advertise-tags=tag:pireplace
+    # What the owner must do, by tailscaled's BackendState (Running needs nothing).
+    pireplace_ts_notes:
+      NeedsLogin: >-
+        Tailscale is not logged in. On the Pi run `{{ pireplace_ts_up_hint }}` and open
+        the link it prints, or set pireplace_tailscale_authkey and deploy again.
+      NeedsMachineAuth: >-
+        Tailscale is logged in but the machine is waiting for approval: approve
+        "pireplace" in the Tailscale admin console (Machines), then deploy again.
+      Stopped: >-
+        Tailscale is logged in but stopped (tailscale down). Run `sudo tailscale up`
+        on the Pi.
+      other: >-
+        tailscaled reported state {{ pireplace_ts_backend_state }}. Check `sudo
+        systemctl status tailscaled` and `sudo tailscale status` on the Pi.
 
   tasks:
     - name: Require Python 3.11 or newer on the Pi
@@ -130,7 +163,7 @@
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Limit unattended-upgrades to security updates (Debian and Raspberry Pi)
+    - name: Limit unattended-upgrades to security updates (Debian, Raspberry Pi, Tailscale)
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/52pireplace-unattended-upgrades
         owner: root
@@ -138,12 +171,15 @@
         mode: "0644"
         content: |
           // Managed by Ansible. Replaces the default origin list: Debian security
-          // updates plus the Raspberry Pi archive (kernel/firmware fixes ship there).
+          // updates, the Raspberry Pi archive (kernel/firmware fixes ship there) and,
+          // when it is installed, Tailscale's repository (limited to Tailscale's own
+          // packages by /etc/apt/preferences.d/tailscale).
           #clear Unattended-Upgrade::Origins-Pattern;
           Unattended-Upgrade::Origins-Pattern {
               "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
               "origin=Debian,codename=${distro_codename},label=Debian-Security";
               "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
+              "origin=Tailscale,codename=${distro_codename},label=Tailscale";
           };
 
     - name: Enable the daily unattended-upgrades run
@@ -157,90 +193,137 @@
           APT::Periodic::Unattended-Upgrade "1";
 
     # --- Tailscale (the Jellyfin server is reached over the tailnet) ------------
-    # Matches a hand install with the official script (same keyring and source file),
-    # so on such a Pi every task here reports ok.
+    # Only with the Jellyfin sync on. Matches a hand install with the official script
+    # (same keyring and source file), so on such a Pi every task here reports ok.
 
-    - name: Look for the Tailscale signing key
-      ansible.builtin.stat:
-        path: /usr/share/keyrings/tailscale-archive-keyring.gpg
-      register: pireplace_ts_keyring
+    - name: Tailscale (only with the Jellyfin sync on)
+      when: pireplace_jf_enabled
+      block:
+        - name: Look for the Tailscale signing key
+          ansible.builtin.stat:
+            path: /usr/share/keyrings/tailscale-archive-keyring.gpg
+          register: pireplace_ts_keyring
 
-    - name: Fetch the Tailscale signing key (only when absent; the package keeps it afterwards)
-      ansible.builtin.get_url:
-        url: "https://pkgs.tailscale.com/stable/debian/{{ ansible_distribution_release }}.noarmor.gpg"
-        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
-        owner: root
-        group: root
-        mode: "0644"
-      when: not pireplace_ts_keyring.stat.exists
-      register: pireplace_ts_key
+        - name: Fetch the Tailscale signing key (only when absent; the package keeps it afterwards)
+          ansible.builtin.get_url:
+            url: "https://pkgs.tailscale.com/stable/debian/{{ ansible_distribution_release }}.noarmor.gpg"
+            dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+            owner: root
+            group: root
+            mode: "0644"
+          when: not pireplace_ts_keyring.stat.exists
+          register: pireplace_ts_key
 
-    # lineinfile (not copy): the official script's file may carry a comment header.
-    - name: Add the Tailscale apt source
-      ansible.builtin.lineinfile:
-        path: /etc/apt/sources.list.d/tailscale.list
-        regexp: '^deb .*pkgs\.tailscale\.com'
-        line: "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian {{ ansible_distribution_release }} main"
-        create: true
-        owner: root
-        group: root
-        mode: "0644"
-      register: pireplace_ts_source
+        # lineinfile (not copy): the official script's file may carry a comment header.
+        - name: Add the Tailscale apt source
+          ansible.builtin.lineinfile:
+            path: /etc/apt/sources.list.d/tailscale.list
+            regexp: '^deb .*pkgs\.tailscale\.com'
+            line: "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian {{ ansible_distribution_release }} main"
+            create: true
+            owner: root
+            group: root
+            mode: "0644"
+          register: pireplace_ts_source
 
-    - name: Refresh apt after adding the Tailscale repository
-      ansible.builtin.apt:
-        update_cache: true
-      when: pireplace_ts_source is changed or pireplace_ts_key is changed
+        # unattended-upgrades follows this origin; only Tailscale's packages may come from it.
+        - name: Pin the Tailscale repository to Tailscale's own packages
+          ansible.builtin.copy:
+            dest: /etc/apt/preferences.d/tailscale
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              # Managed by Ansible. pkgs.tailscale.com may only supply Tailscale's packages.
+              Package: tailscale*
+              Pin: origin pkgs.tailscale.com
+              Pin-Priority: 500
 
-    - name: Install Tailscale
-      ansible.builtin.apt:
-        name:
-          - tailscale
-          - tailscale-archive-keyring
-        state: present
+              Package: *
+              Pin: origin pkgs.tailscale.com
+              Pin-Priority: -1
 
-    - name: Enable and start tailscaled
-      ansible.builtin.systemd_service:
-        name: tailscaled.service
-        enabled: true
-        state: started
+        - name: Refresh apt after adding the Tailscale repository
+          ansible.builtin.apt:
+            update_cache: true
+          when: pireplace_ts_source is changed or pireplace_ts_key is changed
 
-    - name: Query the Tailscale login state
-      ansible.builtin.command: tailscale status --json
-      register: pireplace_ts_status
-      changed_when: false
-      failed_when: false
+        - name: Install Tailscale
+          ansible.builtin.apt:
+            name:
+              - tailscale
+              - tailscale-archive-keyring
+            state: present
 
-    - name: Read the Tailscale login state (BackendState)
-      ansible.builtin.set_fact:
-        pireplace_ts_backend_state: >-
-          {{ (pireplace_ts_status.stdout | from_json).BackendState | default('Unknown')
-             if (pireplace_ts_status.stdout | default('', true) | trim).startswith('{')
-             else 'Unknown' }}
+        - name: Enable and start tailscaled
+          ansible.builtin.systemd_service:
+            name: tailscaled.service
+            enabled: true
+            state: started
 
-    - name: Join the tailnet (only when not logged in and an auth key was given)
-      ansible.builtin.command:
-        argv:
-          - tailscale
-          - up
-          - --hostname=pireplace
-          - --accept-dns=false
-          - "--authkey={{ pireplace_tailscale_authkey }}"
-      when:
-        - pireplace_ts_backend_state != 'Running'
-        - pireplace_tailscale_authkey | default('') | string | length > 0
-      changed_when: true
-      no_log: true
+        - name: Query the Tailscale login state
+          ansible.builtin.command: tailscale status --json
+          register: pireplace_ts_status
+          changed_when: false
+          failed_when: false
 
-    - name: Tell the owner to log Tailscale in
-      ansible.builtin.debug:
-        msg: >-
-          Tailscale is not logged in (state {{ pireplace_ts_backend_state }}). Run
-          `sudo tailscale up --hostname=pireplace --accept-dns=false` on the Pi and
-          open the link it prints, or set pireplace_tailscale_authkey and deploy again.
-      when:
-        - pireplace_ts_backend_state != 'Running'
-        - pireplace_tailscale_authkey | default('') | string | length == 0
+        - name: Read the Tailscale login state (BackendState)
+          ansible.builtin.set_fact:
+            pireplace_ts_backend_state: >-
+              {{ (pireplace_ts_status.stdout | from_json).BackendState | default('Unknown')
+                 if (pireplace_ts_status.stdout | default('', true) | trim).startswith('{')
+                 else 'Unknown' }}
+
+        # Only a node that needs a login: a logged-in node (Running, Stopped, waiting for
+        # approval) is never re-authenticated. --auth-key=file: keeps the key off argv;
+        # --shields-up because nothing on the tailnet needs to connect to the Pi.
+        - name: Join the tailnet (only when it needs a login and an auth key was given)
+          when:
+            - pireplace_ts_backend_state == 'NeedsLogin'
+            - pireplace_ts_have_key
+          block:
+            - name: Write the Tailscale auth key to a root-only file
+              ansible.builtin.copy:
+                dest: "{{ pireplace_ts_authkey_file }}"
+                content: "{{ pireplace_tailscale_authkey | string | trim }}"
+                owner: root
+                group: root
+                mode: "0600"
+              no_log: true
+
+            - name: Run tailscale up with the auth key
+              ansible.builtin.command:
+                argv:
+                  - tailscale
+                  - up
+                  - --hostname=pireplace
+                  - --accept-dns=false
+                  - --shields-up
+                  - --advertise-tags=tag:pireplace
+                  - --timeout=60s
+                  - "--auth-key=file:{{ pireplace_ts_authkey_file }}"
+              changed_when: true
+              no_log: true
+          rescue:
+            - name: Explain the failed Tailscale login
+              ansible.builtin.fail:
+                msg: >-
+                  tailscale up failed: auth key rejected (expired, already used, or not
+                  allowed to apply tag:pireplace) or no connection within 60 s. Re-authenticate
+                  by hand: on the Pi run `{{ pireplace_ts_up_hint }}`, open the link, then
+                  deploy again.
+          always:
+            - name: Remove the Tailscale auth key file
+              ansible.builtin.file:
+                path: "{{ pireplace_ts_authkey_file }}"
+                state: absent
+
+        - name: Tell the owner what Tailscale needs
+          ansible.builtin.debug:
+            msg: "{{ pireplace_ts_notes[pireplace_ts_backend_state] | default(pireplace_ts_notes['other']) }}"
+          when:
+            - pireplace_ts_backend_state != 'Running'
+            - not (pireplace_ts_backend_state == 'NeedsLogin' and pireplace_ts_have_key)
 
     # --- service user ----------------------------------------------------------
 
