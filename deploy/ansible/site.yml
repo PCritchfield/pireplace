@@ -271,15 +271,15 @@
     # make WirePlumber choose it as the default sink.
     - name: Create the pireplace PipeWire config directory
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: "{{ item.path }}"
         state: directory
         owner: "{{ pireplace_user }}"
         group: "{{ pireplace_user }}"
-        mode: "0755"
+        mode: "{{ item.mode | default(omit) }}"
       loop:
-        - "{{ pireplace_home }}/.config"
-        - "{{ pireplace_home }}/.config/pipewire"
-        - "{{ pireplace_home }}/.config/pipewire/pipewire.conf.d"
+        - path: "{{ pireplace_home }}/.config"   # existing mode is kept
+        - {path: "{{ pireplace_home }}/.config/pipewire", mode: "0755"}
+        - {path: "{{ pireplace_home }}/.config/pipewire/pipewire.conf.d", mode: "0755"}
 
     - name: Install the HDMI sink drop-in for the pireplace PipeWire
       ansible.builtin.copy:

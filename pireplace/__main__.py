@@ -37,7 +37,6 @@ DEFAULT_CONFIG = "/etc/pireplace/config.toml"
 PLAYER_TIMEOUT = 3.0
 
 
-
 def reconcile_forever(
     fireplace: Fireplace,
     stop: threading.Event,
