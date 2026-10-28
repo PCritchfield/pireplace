@@ -150,9 +150,10 @@ What runs on the Pi:
 sudo systemctl status pireplace-control pireplace-wifi
 journalctl -u pireplace-control -e
 journalctl -u pireplace-wifi -e
-sudo journalctl --user -M pireplace@ -u pireplace-video -e
-sudo systemctl --user -M pireplace@ status pireplace-video pireplace-music
-sudo systemctl --user -M pireplace@ restart pireplace-music
+sudo journalctl _SYSTEMD_USER_UNIT=pireplace-video.service -e
+sudo journalctl _SYSTEMD_USER_UNIT=pireplace-music.service -e
+sudo systemctl --user --machine=pireplace@.host status pireplace-video pireplace-music
+sudo systemctl --user --machine=pireplace@.host restart pireplace-music
 ```
 
 All four restart on their own after a crash (`Restart=always`, and systemd never gives up).
@@ -183,6 +184,18 @@ hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and r
   or still the `CHANGE_ME` placeholder.
 - **Boot messages are gone from the TV:** that is intended. They go to tty3: press
   Ctrl+Alt+F3 on a keyboard attached to the Pi, or run `journalctl -b`.
+- **No sound on the TV:** the deploy adds an HDMI sink on ALSA card `vc4hdmi0` (the port
+  nearest the power socket) and turns the headphone jack off (needs a reboot). Check
+  that it exists and is the default (marked `*`):
+
+  ```sh
+  sudo -u pireplace XDG_RUNTIME_DIR=/run/user/$(id -u pireplace) wpctl status
+  ```
+
+  There should be a "Fireplace HDMI" sink. If the TV is on the other port, deploy with
+  `-e pireplace_hdmi_card=vc4hdmi1`. `aplay -l` lists the cards.
+- **`Cannot load libcuda.so.1` in the mpv log:** harmless. mpv probes hardware decoders
+  and CUDA does not exist on a Pi.
 - **Deploy ends with "REBOOT REQUIRED":** the boot settings that keep console text off
   the TV changed. Run `sudo reboot` on the Pi.
 
@@ -202,9 +215,9 @@ Run through this on the real Pi 4 and tick each item.
 - [ ] Phone at `http://pireplace.local`: mood switch, pause/play, next, both volumes,
       log mute. Each affects only its own stream.
 - [ ] `sudo systemctl kill pireplace-control` and
-      `sudo systemctl --user -M pireplace@ kill pireplace-music`: both return on their own;
+      `sudo systemctl --user --machine=pireplace@.host kill pireplace-music`: both return on their own;
       the video never stops.
-- [ ] `sudo systemctl --user -M pireplace@ restart pireplace-video` while playing: the fire
+- [ ] `sudo systemctl --user --machine=pireplace@.host restart pireplace-video` while playing: the fire
       is back within about 5 s with its sound at the same volume and mute setting.
 - [ ] Pull power, restore: same mood and volumes as before.
 - [ ] Router off for 2 minutes, then on: no hotspot appears, the box rejoins.
@@ -215,5 +228,5 @@ Run through this on the real Pi 4 and tick each item.
       `-e pireplace_hotspot_address=<that address>` (in `ANSIBLE_ARGS`).
 - [ ] From the home network, `http://pireplace.local/setup` says not found.
 - [ ] Empty `/srv/pireplace/videos`, press Rescan: black screen, the page shows the
-      message, nothing crash-loops (`sudo systemctl --user -M pireplace@ status pireplace-video`
+      message, nothing crash-loops (`sudo systemctl --user --machine=pireplace@.host status pireplace-video`
       stays stable).
