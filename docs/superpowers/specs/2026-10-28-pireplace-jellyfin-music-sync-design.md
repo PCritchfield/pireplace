@@ -29,14 +29,17 @@ on the server or the network being up during a party.
 - Public `https://mmumbless.duckdns.org` works but goes out and back in through
   the router (hairpin), which has been flaky; not to be used.
 - Four playlists exist, owned by Jellyfin user `mmumbless`
-  (Id `1b7ed00cbdcc4a1eb624738191ca4efd`), private:
+  (Id `1b7ed00cbdcc4a1eb624738191ca4efd`), shared read-only with the non-admin
+  user `music-streaming` (Id `4640835a50a94bc69709d00d6f332fac`). They were
+  recreated after review (see "Changes after review"); the Ids below are the new
+  ones:
 
   | Playlist | Jellyfin Id | Tracks | Length |
   |---|---|---|---|
-  | Fireplace – Modern | `385d9e4b0602d3d75a00bc6d31dc5aa6` | 86 | 4.96 h |
-  | Fireplace – Classic Swing | `dfbf231b1aaa92df17ff5248fbde6fbf` | 105 | 4.97 h |
-  | Fireplace – Soul & Motown | `352617a64fc727e324fd1bfa625cb0f6` | 64 | 4.18 h |
-  | Fireplace – Instrumental | `a371cfe3e0f01be7542358ad2f50f7b5` | 39 | 2.42 h |
+  | Fireplace – Modern | `dc8d8d54ecad68b2546b5c7c9b4b4766` | 86 | 4.96 h |
+  | Fireplace – Classic Swing | `f4b96696936ec335bfeca0c623ad0669` | 105 | 4.97 h |
+  | Fireplace – Soul & Motown | `79525d419fccb3bec7c38cef5fe07b11` | 64 | 4.18 h |
+  | Fireplace – Instrumental | `30bf4d0f66600b1d1dd8cded00e25705` | 39 | 2.42 h |
 
   About 40 other auto-generated playlists exist on the server; select by Id.
 - Jellyfin API notes (verified by the session that built the playlists):
@@ -222,3 +225,71 @@ Claude's calls (owner may override):
 - Retry and backoff details for downloads.
 - Whether to verify downloads by size against Jellyfin's metadata.
 - Log format.
+
+## Changes after review (2026-10-28)
+
+A whole-branch review and three guardian reviews (security, architecture,
+infrastructure) changed these decisions. Where they conflict with the sections
+above, this section wins.
+
+- **Credential: a limited user's access token, not an API key.** Dashboard API
+  keys act as an administrator and cannot call the per-user playlist endpoints.
+  The sync authenticates as the dedicated non-admin Jellyfin user
+  `music-streaming` (Music library only, downloads allowed). Its access token
+  comes from `POST /Users/AuthenticateByName` via `scripts/jellyfin_token.sh`
+  (prompts, password never on argv). The inventory variable keeps the name
+  `pireplace_jellyfin_api_key`; `pireplace_jellyfin_user_id` is that user's Id
+  (default `4640835a50a94bc69709d00d6f332fac`). This replaces the "Step 0" plan
+  of relying on an API key's admin rights; "never a user password on the Pi"
+  still holds (only the token is stored).
+- **Playlists recreated.** Jellyfin 12.2 crashes when a share is added to an
+  existing private playlist, so the four playlists were recreated with the
+  read-only share in the create call (`POST /Playlists` with
+  `"Users":[{"UserId":"<sync user id>","CanEdit":false}]`). New Ids are in the
+  table under "Current state"; the old ones are gone.
+- **Token storage.** `/etc/pireplace/jellyfin.key` is root:root 0600 (was
+  root:pireplace 0640). `pireplace-sync.service` receives it with
+  `LoadCredential=jellyfin.key:...`; the CLI prefers
+  `$CREDENTIALS_DIRECTORY/jellyfin.key` and falls back to `api_key_file`. The
+  control page, Wi-Fi watcher and players cannot read it; on demand means
+  `systemctl start pireplace-sync`, not a hand run as `pireplace`.
+- **Network confinement.** The sync unit has `IPAddressDeny=any`, allows
+  loopback plus the Jellyfin host (an Ansible drop-in built from the host of
+  `pireplace_jellyfin_url`, which must therefore be an IPv4 address), and
+  `RestrictNetworkInterfaces=lo tailscale0`; also no capabilities,
+  `PrivateIPC`, `SystemCallFilter=@system-service`. The control page refuses
+  Tailscale's ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`). The Jellyfin
+  client ignores environment proxies.
+- **Tailscale gated on the feature.** Every Tailscale task (repo, key, pin,
+  package, service, login) is one block that runs only when the Jellyfin token
+  is set; a plain redeploy installs no Tailscale. `tailscale up` runs only in
+  state `NeedsLogin` with an auth key, adds `--shields-up`,
+  `--advertise-tags=tag:pireplace` and `--timeout=60s`, and reads the key from a
+  root-only file (`--auth-key=file:`), removed afterwards; a failure stops the
+  deploy with the manual command. The note to the owner follows the actual
+  state. unattended-upgrades follows the Tailscale origin, and an apt pin limits
+  that repository to `tailscale*` packages.
+- **Tailnet policy.** The README now gives a complete minimal policy that
+  replaces the default allow-all rule (tags `tag:pireplace`, `tag:jellyfin`; the
+  Pi reaches only `tcp:8096` on Jellyfin; only the owner's devices reach the Pi,
+  on `tcp:22`), how to tag joined nodes, and checks to run from the Pi.
+- **Rescan deferred while playing.** Before rescanning, the sync reads
+  `GET /api/status`. If music is playing, the status is unknown, or the rescan
+  fails, it writes `<music dir>/.pireplace-rescan-pending` and a later run
+  rescans when the music is not playing, even if that run changed nothing. The
+  sync sends no `Host` header of its own; the control page accepts its own
+  address.
+- **Retries.** The sync unit restarts on failure every 10 minutes (at most 4
+  starts in 6 hours), never on exit status 2, with `TimeoutStartSec=6h`. Each
+  download has a 15-minute deadline.
+- **Download before delete.** Within a mood, downloads run first, then
+  deletions (deletions still happen if some downloads failed). The up-front space
+  check is unchanged and skipped when nothing is to be fetched.
+- **Sync correctness.** Each mood is isolated (any filesystem error becomes that
+  mood's error); download failures, delete failures and playlist items with an
+  invalid Id (not 32 hex) are counted and logged separately; the list request
+  asks for `fields=MediaSources`; downloads are fsynced, written to a freshly
+  created `.part` (never through a link), and a same-name file whose size
+  differs from Jellyfin's is downloaded again rather than adopted; extensions
+  are capped at 16 bytes and Unicode format characters are stripped from names;
+  a corrupt or missing manifest with synced files logs that ownership was reset.
