@@ -1,6 +1,9 @@
 """Text-level checks of the systemd units, polkit rule and playbook (no Pi needed)."""
 
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -176,3 +179,72 @@ def test_console_task_never_leaves_no_tty_console():
 def test_playbook_warns_about_last_console_and_disables_cloud_init():
     assert "never remove the last usable console" in SITE
     assert "path: /etc/cloud/cloud-init.disabled" in SITE
+
+
+def _tasks():
+    return [t for play in yaml.safe_load(SITE) for t in play.get("tasks", [])]
+
+
+def test_playbook_installs_hdmi_sink_dropin_for_the_pireplace_user():
+    play = yaml.safe_load(SITE)[1]
+    assert play["vars"]["pireplace_hdmi_card"] == "vc4hdmi0"
+    task = next(t for t in _tasks() if "50-pireplace-hdmi.conf" in str(t.get("ansible.builtin.copy", {})))
+    copy = task["ansible.builtin.copy"]
+    assert copy["dest"].endswith("/.config/pipewire/pipewire.conf.d/50-pireplace-hdmi.conf")
+    assert copy["owner"] == "{{ pireplace_user }}"
+    content = copy["content"]
+    assert 'api.alsa.path    = "hdmi:CARD={{ pireplace_hdmi_card }},DEV=0"' in content
+    assert "factory.name     = api.alsa.pcm.sink" in content
+    assert "media.class      = Audio/Sink" in content
+    assert "priority.session = 2000" in content and "priority.driver  = 2000" in content
+    assert task["notify"] == "Restart pireplace audio and player units"
+
+
+def test_audio_handler_restarts_pipewire_and_players_without_machined():
+    handlers = {h["name"]: h for h in yaml.safe_load(SITE)[1]["handlers"]}
+    cmd = handlers["Restart pireplace audio and player units"]["ansible.builtin.shell"]["cmd"]
+    assert "--machine={{ pireplace_user }}@.host restart pipewire.service wireplumber.service" in cmd
+    assert "{{ pireplace_user_units | join(' ') }}" in cmd
+    assert "-M " not in cmd
+
+
+def test_headphone_audio_off_is_registered_for_reboot_required():
+    last_task = SITE.split("\n  handlers:", 1)[0].rsplit("- name:", 1)[1]
+    assert "pireplace_audio_off is changed" in last_task
+
+
+def _run_audio_off(path: Path) -> subprocess.CompletedProcess:
+    task = next(t for t in _tasks() if t.get("register") == "pireplace_audio_off")
+    task = {**task, "ansible.builtin.lineinfile": {**task["ansible.builtin.lineinfile"], "path": str(path)}}
+    play = [{"hosts": "localhost", "connection": "local", "gather_facts": False, "tasks": [task]}]
+    playbook = path.with_name("audio.yml")
+    playbook.write_text(yaml.safe_dump(play))
+    ansible = Path(sys.executable).with_name("ansible-playbook")
+    if not ansible.exists():
+        pytest.skip("ansible-playbook not installed")
+    env = {**os.environ, "ANSIBLE_LOCALHOST_WARNING": "False", "ANSIBLE_HOME": str(path.parent / ".ansible")}
+    return subprocess.run(
+        [str(ansible), "-i", "localhost,", str(playbook)],
+        capture_output=True, text=True, env=env, cwd=path.parent, check=True,
+    )
+
+
+def test_dtparam_audio_off_replaces_on_once_and_is_idempotent(tmp_path):
+    config = tmp_path / "config.txt"
+    config.write_text("# comment\ndtparam=i2c_arm=on\ndtparam=audio=on\ndtoverlay=vc4-kms-v3d\n[all]\n")
+    first = _run_audio_off(config)
+    assert "changed=1" in first.stdout
+    lines = config.read_text().splitlines()
+    assert lines.count("dtparam=audio=off") == 1
+    assert not any(line.startswith("dtparam=audio=on") for line in lines)
+    assert lines[2] == "dtparam=audio=off" and "dtparam=i2c_arm=on" in lines
+    before = config.read_text()
+    second = _run_audio_off(config)
+    assert "changed=0" in second.stdout and config.read_text() == before
+
+
+def test_dtparam_audio_off_is_appended_when_absent(tmp_path):
+    config = tmp_path / "config.txt"
+    config.write_text("dtoverlay=vc4-kms-v3d\n")
+    _run_audio_off(config)
+    assert config.read_text().splitlines().count("dtparam=audio=off") == 1

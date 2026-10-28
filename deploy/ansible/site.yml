@@ -49,6 +49,9 @@
     pireplace_moods:
       - modern
       - classic-swing
+    # ALSA card of the HDMI port that carries sound: vc4hdmi0 is the port nearest the
+    # USB-C power socket (HDMI-A-1), vc4hdmi1 the one farther from it.
+    pireplace_hdmi_card: vc4hdmi0
     pireplace_cmdline_args: quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0
     pireplace_user_units:
       - pireplace-video.service
@@ -87,7 +90,7 @@
           - wireplumber
           - network-manager
           # polkit evaluates 50-pireplace.rules; dbus-user-session gives the lingering
-          # pireplace user manager its session bus (PipeWire, systemctl --user -M).
+          # pireplace user manager its session bus (PipeWire, systemctl --user --machine=).
           - polkitd
           - dbus-user-session
           - avahi-daemon
@@ -261,6 +264,51 @@
       loop: "{{ pireplace_user_units }}"
       notify: Restart pireplace player units
 
+    # --- HDMI audio ------------------------------------------------------------
+    # WirePlumber's ACP only offers off/pro-audio for the vc4-hdmi cards, so no HDMI
+    # sink appears on its own. This defines one directly on ALSA's hdmi: PCM (which
+    # converts to the IEC958 subframes the vc4 hardware needs). The high priorities
+    # make WirePlumber choose it as the default sink.
+    - name: Create the pireplace PipeWire config directory
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ pireplace_user }}"
+        group: "{{ pireplace_user }}"
+        mode: "0755"
+      loop:
+        - "{{ pireplace_home }}/.config"
+        - "{{ pireplace_home }}/.config/pipewire"
+        - "{{ pireplace_home }}/.config/pipewire/pipewire.conf.d"
+
+    - name: Install the HDMI sink drop-in for the pireplace PipeWire
+      ansible.builtin.copy:
+        dest: "{{ pireplace_home }}/.config/pipewire/pipewire.conf.d/50-pireplace-hdmi.conf"
+        owner: "{{ pireplace_user }}"
+        group: "{{ pireplace_user }}"
+        mode: "0644"
+        content: |
+          # Managed by Ansible. HDMI sink on ALSA card {{ pireplace_hdmi_card }}.
+          context.objects = [
+              {   factory = adapter
+                  args = {
+                      factory.name     = api.alsa.pcm.sink
+                      node.name        = pireplace-hdmi
+                      node.description = "Fireplace HDMI"
+                      media.class      = Audio/Sink
+                      api.alsa.path    = "hdmi:CARD={{ pireplace_hdmi_card }},DEV=0"
+                      audio.format     = S16LE
+                      audio.rate       = 48000
+                      audio.channels   = 2
+                      audio.position   = [ FL FR ]
+                      priority.session = 2000
+                      priority.driver  = 2000
+                      node.pause-on-idle = false
+                  }
+              }
+          ]
+      notify: Restart pireplace audio and player units
+
     - name: Apply tmpfiles and systemd changes now
       ansible.builtin.meta: flush_handlers
 
@@ -371,6 +419,15 @@
         line: disable_splash=1
       register: pireplace_configtxt
 
+    # The headphone jack is not used; HDMI carries the sound. lineinfile replaces the
+    # (last) existing dtparam=audio= line, or appends one, so there is exactly one.
+    - name: Turn off the onboard headphone-jack audio (takes effect after a reboot)
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^#?\s*dtparam=audio='
+        line: dtparam=audio=off
+      register: pireplace_audio_off
+
     - name: Disable the login prompt on tty1
       ansible.builtin.systemd_service:
         name: getty@tty1.service
@@ -382,7 +439,7 @@
         msg: >-
           REBOOT REQUIRED: /boot/firmware/cmdline.txt or config.txt changed. Run
           `sudo reboot` on the Pi so the TV shows only the fire.
-      when: pireplace_cmdline is changed or pireplace_console is changed or pireplace_console_serial is changed or pireplace_console_start is changed or pireplace_configtxt is changed
+      when: pireplace_cmdline is changed or pireplace_console is changed or pireplace_console_serial is changed or pireplace_console_start is changed or pireplace_configtxt is changed or pireplace_audio_off is changed
 
   handlers:
     - name: Reload systemd
@@ -404,6 +461,16 @@
         cmd: |
           set -e
           systemctl --user --machine={{ pireplace_user }}@.host daemon-reload
+          systemctl --user --machine={{ pireplace_user }}@.host restart {{ pireplace_user_units | join(' ') }}
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Restart pireplace audio and player units
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          systemctl --user --machine={{ pireplace_user }}@.host daemon-reload
+          systemctl --user --machine={{ pireplace_user }}@.host restart pipewire.service wireplumber.service pipewire-pulse.service
           systemctl --user --machine={{ pireplace_user }}@.host restart {{ pireplace_user_units | join(' ') }}
         executable: /bin/bash
       changed_when: true
