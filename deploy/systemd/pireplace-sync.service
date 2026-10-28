@@ -1,0 +1,44 @@
+[Unit]
+Description=pireplace music sync from Jellyfin
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+# One run per timer firing. No Restart: a failed night is retried by the next night's
+# timer (or by hand), and exit status 1 or 2 must not loop.
+Type=oneshot
+User=pireplace
+Group=pireplace
+WorkingDirectory=/opt/pireplace
+Environment=PYTHONPATH=/opt/pireplace
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m pireplace sync --config /etc/pireplace/config.toml
+# Keep the fire and music smooth while it downloads.
+Nice=10
+IOSchedulingClass=idle
+
+# Group-writable files so the SSH admin user (in the pireplace group) can manage them.
+UMask=0002
+# The only writable path is the music tree. The API key is read from /etc/pireplace.
+ReadWritePaths=/srv/pireplace/music
+
+# Hardening, as pireplace-control.service. Network access is needed for Jellyfin (over
+# Tailscale) and the loopback rescan call; AF_UNIX for name resolution and logging.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

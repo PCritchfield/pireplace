@@ -59,6 +59,22 @@
     pireplace_system_units:
       - pireplace-control.service
       - pireplace-wifi.service
+    # Jellyfin music sync. Optional inventory vars: pireplace_jellyfin_api_key (turns it
+    # on), pireplace_jellyfin_url, pireplace_jellyfin_user_id, pireplace_jellyfin_playlists
+    # and pireplace_tailscale_authkey. Play vars outrank inventory vars, so the defaults
+    # live in the pireplace_jf_* names and an inventory override is read through them.
+    pireplace_jf_enabled: "{{ (pireplace_jellyfin_api_key | default('') | string | length) > 0 }}"
+    pireplace_jf_url: "{{ pireplace_jellyfin_url | default('http://100.88.8.6:8096') }}"
+    pireplace_jf_user_id: "{{ pireplace_jellyfin_user_id | default('1b7ed00cbdcc4a1eb624738191ca4efd') }}"
+    pireplace_jf_playlists: "{{ pireplace_jellyfin_playlists | default(pireplace_jf_default_playlists) }}"
+    pireplace_jf_default_playlists:
+      modern: 385d9e4b0602d3d75a00bc6d31dc5aa6
+      classic-swing: dfbf231b1aaa92df17ff5248fbde6fbf
+      soul-motown: 352617a64fc727e324fd1bfa625cb0f6
+      instrumental: a371cfe3e0f01be7542358ad2f50f7b5
+    pireplace_sync_units:
+      - pireplace-sync.service
+      - pireplace-sync.timer
 
   tasks:
     - name: Require Python 3.11 or newer on the Pi
@@ -125,6 +141,92 @@
         content: |
           APT::Periodic::Update-Package-Lists "1";
           APT::Periodic::Unattended-Upgrade "1";
+
+    # --- Tailscale (the Jellyfin server is reached over the tailnet) ------------
+    # Matches a hand install with the official script (same keyring and source file),
+    # so on such a Pi every task here reports ok.
+
+    - name: Look for the Tailscale signing key
+      ansible.builtin.stat:
+        path: /usr/share/keyrings/tailscale-archive-keyring.gpg
+      register: pireplace_ts_keyring
+
+    - name: Fetch the Tailscale signing key (only when absent; the package keeps it afterwards)
+      ansible.builtin.get_url:
+        url: "https://pkgs.tailscale.com/stable/debian/{{ ansible_distribution_release }}.noarmor.gpg"
+        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+        owner: root
+        group: root
+        mode: "0644"
+      when: not pireplace_ts_keyring.stat.exists
+      register: pireplace_ts_key
+
+    # lineinfile (not copy): the official script's file may carry a comment header.
+    - name: Add the Tailscale apt source
+      ansible.builtin.lineinfile:
+        path: /etc/apt/sources.list.d/tailscale.list
+        regexp: '^deb .*pkgs\.tailscale\.com'
+        line: "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian {{ ansible_distribution_release }} main"
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: pireplace_ts_source
+
+    - name: Refresh apt after adding the Tailscale repository
+      ansible.builtin.apt:
+        update_cache: true
+      when: pireplace_ts_source is changed or pireplace_ts_key is changed
+
+    - name: Install Tailscale
+      ansible.builtin.apt:
+        name:
+          - tailscale
+          - tailscale-archive-keyring
+        state: present
+
+    - name: Enable and start tailscaled
+      ansible.builtin.systemd_service:
+        name: tailscaled.service
+        enabled: true
+        state: started
+
+    - name: Query the Tailscale login state
+      ansible.builtin.command: tailscale status --json
+      register: pireplace_ts_status
+      changed_when: false
+      failed_when: false
+
+    - name: Read the Tailscale login state (BackendState)
+      ansible.builtin.set_fact:
+        pireplace_ts_backend_state: >-
+          {{ (pireplace_ts_status.stdout | from_json).BackendState | default('Unknown')
+             if (pireplace_ts_status.stdout | default('', true) | trim).startswith('{')
+             else 'Unknown' }}
+
+    - name: Join the tailnet (only when not logged in and an auth key was given)
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - up
+          - --hostname=pireplace
+          - --accept-dns=false
+          - "--authkey={{ pireplace_tailscale_authkey }}"
+      when:
+        - pireplace_ts_backend_state != 'Running'
+        - pireplace_tailscale_authkey | default('') | string | length > 0
+      changed_when: true
+      no_log: true
+
+    - name: Tell the owner to log Tailscale in
+      ansible.builtin.debug:
+        msg: >-
+          Tailscale is not logged in (state {{ pireplace_ts_backend_state }}). Run
+          `sudo tailscale up --hostname=pireplace --accept-dns=false` on the Pi and
+          open the link it prints, or set pireplace_tailscale_authkey and deploy again.
+      when:
+        - pireplace_ts_backend_state != 'Running'
+        - pireplace_tailscale_authkey | default('') | string | length == 0
 
     # --- service user ----------------------------------------------------------
 
@@ -214,6 +316,23 @@
       no_log: true
       notify: Restart pireplace system services
 
+    # Read by the sync service as the pireplace group; the key itself is not in config.toml.
+    - name: Install the Jellyfin API key file
+      ansible.builtin.copy:
+        dest: /etc/pireplace/jellyfin.key
+        content: "{{ pireplace_jellyfin_api_key }}\n"
+        owner: root
+        group: "{{ pireplace_user }}"
+        mode: "0640"
+      when: pireplace_jf_enabled
+      no_log: true
+
+    - name: Remove the Jellyfin API key file (no key configured)
+      ansible.builtin.file:
+        path: /etc/pireplace/jellyfin.key
+        state: absent
+      when: not pireplace_jf_enabled
+
     - name: Create media directories
       ansible.builtin.file:
         path: "{{ item }}"
@@ -221,7 +340,7 @@
         owner: "{{ pireplace_user }}"
         group: "{{ pireplace_user }}"
         mode: "2775"
-      loop: "{{ ['/srv/pireplace', '/srv/pireplace/videos', '/srv/pireplace/music'] + (pireplace_moods | map('regex_replace', '^', '/srv/pireplace/music/') | list) }}"
+      loop: "{{ ['/srv/pireplace', '/srv/pireplace/videos', '/srv/pireplace/music'] + ((pireplace_jf_playlists.keys() | list if pireplace_jf_enabled else pireplace_moods) | map('regex_replace', '^', '/srv/pireplace/music/') | list) }}"
 
     # --- systemd, tmpfiles, polkit --------------------------------------------
 
@@ -253,6 +372,40 @@
       notify:
         - Reload systemd
         - Restart pireplace system services
+
+    - name: Install the Jellyfin sync units (service and timer)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../systemd/{{ item }}"
+        dest: /etc/systemd/system/{{ item }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pireplace_sync_units }}"
+      when: pireplace_jf_enabled
+      notify: Reload systemd
+
+    - name: Look for installed Jellyfin sync units
+      ansible.builtin.stat:
+        path: /etc/systemd/system/pireplace-sync.timer
+      register: pireplace_sync_timer_unit
+      when: not pireplace_jf_enabled
+
+    - name: Disable and stop the Jellyfin sync timer (no key configured)
+      ansible.builtin.systemd_service:
+        name: pireplace-sync.timer
+        enabled: false
+        state: stopped
+      when:
+        - not pireplace_jf_enabled
+        - pireplace_sync_timer_unit.stat.exists
+
+    - name: Remove the Jellyfin sync units (no key configured)
+      ansible.builtin.file:
+        path: /etc/systemd/system/{{ item }}
+        state: absent
+      loop: "{{ pireplace_sync_units }}"
+      when: not pireplace_jf_enabled
+      notify: Reload systemd
 
     - name: Install user units (run by the pireplace user manager)
       ansible.builtin.copy:
@@ -352,6 +505,13 @@
         enabled: true
         state: started
       loop: "{{ pireplace_system_units }}"
+
+    - name: Enable and start the Jellyfin sync timer
+      ansible.builtin.systemd_service:
+        name: pireplace-sync.timer
+        enabled: true
+        state: started
+      when: pireplace_jf_enabled
 
     # --- quiet TV --------------------------------------------------------------
 

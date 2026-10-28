@@ -248,3 +248,148 @@ def test_dtparam_audio_off_is_appended_when_absent(tmp_path):
     config.write_text("dtoverlay=vc4-kms-v3d\n")
     _run_audio_off(config)
     assert config.read_text().splitlines().count("dtparam=audio=off") == 1
+
+
+# --- Jellyfin sync and Tailscale -----------------------------------------------------
+
+
+def _task(name_part: str) -> dict:
+    return next(t for t in _tasks() if name_part in t["name"])
+
+
+def test_sync_service_is_a_hardened_oneshot_that_writes_only_the_music_dir():
+    service = unit("pireplace-sync.service")["Service"]
+    assert service["Type"] == ["oneshot"]
+    assert service["User"] == ["pireplace"] and service["Group"] == ["pireplace"]
+    assert service["UMask"] == ["0002"]
+    assert service["ReadWritePaths"] == ["/srv/pireplace/music"]
+    assert service["ExecStart"] == [
+        "/usr/bin/python3 -m pireplace sync --config /etc/pireplace/config.toml"
+    ]
+    assert service["ProtectSystem"] == ["strict"] and service["ProtectHome"] == ["yes"]
+    assert service["RestrictAddressFamilies"] == ["AF_INET AF_INET6 AF_UNIX"]
+    assert service["Nice"] == ["10"] and service["IOSchedulingClass"] == ["idle"]
+    assert "Restart" not in service and "RestartPreventExitStatus" not in service
+    for key, value in HARDENING.items():
+        if key != "UMask":
+            assert service[key] == [value], key
+
+
+def test_sync_timer_runs_nightly_and_catches_up():
+    parsed = unit("pireplace-sync.timer")
+    assert parsed["Timer"]["OnCalendar"] == ["*-*-* 04:30:00"]
+    assert parsed["Timer"]["Persistent"] == ["true"]
+    assert parsed["Timer"]["RandomizedDelaySec"] == ["5min"]
+    assert parsed["Install"]["WantedBy"] == ["timers.target"]
+
+
+def test_jellyfin_key_file_is_secret_and_only_present_with_a_key():
+    present = next(t for t in _tasks() if "ansible.builtin.copy" in t
+                   and t["ansible.builtin.copy"].get("dest") == "/etc/pireplace/jellyfin.key")
+    copy = present["ansible.builtin.copy"]
+    assert present["no_log"] is True
+    assert copy["mode"] == "0640" and copy["owner"] == "root" and copy["group"] == "{{ pireplace_user }}"
+    assert present["when"] == "pireplace_jf_enabled"
+    absent = next(t for t in _tasks() if "ansible.builtin.file" in t
+                  and t["ansible.builtin.file"].get("path") == "/etc/pireplace/jellyfin.key")
+    assert absent["ansible.builtin.file"]["state"] == "absent"
+    assert absent["when"] == "not pireplace_jf_enabled"
+
+
+def test_sync_units_and_timer_depend_on_the_api_key():
+    play = yaml.safe_load(SITE)[1]
+    assert "pireplace_jellyfin_api_key" in play["vars"]["pireplace_jf_enabled"]
+    install = _task("Install the Jellyfin sync units")
+    assert install["when"] == "pireplace_jf_enabled"
+    enable = _task("Enable and start the Jellyfin sync timer")
+    assert enable["when"] == "pireplace_jf_enabled"
+    assert enable["ansible.builtin.systemd_service"]["name"] == "pireplace-sync.timer"
+    removal = [t for t in _tasks() if "Jellyfin sync" in t["name"] and t.get("when") != "pireplace_jf_enabled"]
+    assert removal, "a key-less deploy must disable and remove the timer"
+    assert all("not pireplace_jf_enabled" in str(t["when"]) for t in removal)
+    # the sync units are not part of the always-restarted controller set
+    assert "pireplace-sync" not in " ".join(play["vars"]["pireplace_system_units"])
+
+
+def test_mood_folders_follow_the_playlists_when_syncing():
+    loop = _task("Create media directories")["loop"]
+    assert "pireplace_jf_enabled" in loop and "pireplace_jf_playlists" in loop and "pireplace_moods" in loop
+
+
+def test_tailscale_matches_the_hand_installed_state():
+    keyring = "/usr/share/keyrings/tailscale-archive-keyring.gpg"
+    fetch = _task("Fetch the Tailscale signing key")
+    assert fetch["ansible.builtin.get_url"]["dest"] == keyring
+    assert fetch["ansible.builtin.get_url"]["url"] == (
+        "https://pkgs.tailscale.com/stable/debian/{{ ansible_distribution_release }}.noarmor.gpg")
+    assert "not" in fetch["when"] and "exists" in fetch["when"]
+    source = _task("Add the Tailscale apt source")["ansible.builtin.lineinfile"]
+    assert source["path"] == "/etc/apt/sources.list.d/tailscale.list"
+    assert source["line"] == (f"deb [signed-by={keyring}] https://pkgs.tailscale.com/stable/debian "
+                              "{{ ansible_distribution_release }} main")
+    assert _task("Install Tailscale")["ansible.builtin.apt"]["name"] == [
+        "tailscale", "tailscale-archive-keyring"]
+    assert _task("Enable and start tailscaled")["ansible.builtin.systemd_service"]["name"] == "tailscaled.service"
+    assert SITE.count("sources.list.d/tailscale") == 1  # never a second source file
+
+
+def test_tailscale_up_is_secret_and_only_runs_when_not_running():
+    state = _task("Read the Tailscale login state")
+    assert "BackendState" in str(state["ansible.builtin.set_fact"])
+    up = _task("Join the tailnet")
+    assert up["no_log"] is True
+    argv = up["ansible.builtin.command"]["argv"]
+    assert argv[:4] == ["tailscale", "up", "--hostname=pireplace", "--accept-dns=false"]
+    assert argv[4].startswith("--authkey=")
+    guard = " ".join(up["when"])
+    assert "pireplace_ts_backend_state != 'Running'" in guard and "pireplace_tailscale_authkey" in guard
+    note = _task("Tell the owner to log Tailscale in")
+    assert "sudo tailscale up --hostname=pireplace --accept-dns=false" in note["ansible.builtin.debug"]["msg"]
+    assert "pireplace_tailscale_authkey" in " ".join(note["when"])
+
+
+def _render_config(extra: dict, directory: Path) -> Path:
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.template import Templar, trust_as_template
+
+    # Values read with yaml.safe_load are untrusted; mark the play vars as templates.
+    play_vars = {
+        k: trust_as_template(v) if isinstance(v, str) else v
+        for k, v in yaml.safe_load(SITE)[1]["vars"].items()
+    }
+    play_vars.update(hotspot_password="a-test-password", **extra)
+    templar = Templar(loader=DataLoader(), variables=play_vars)
+    text = (ROOT / "deploy" / "ansible" / "templates" / "config.toml.j2").read_text()
+    out = directory / "etc" / "config.toml"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(templar.template(trust_as_template(text)))
+    return out
+
+
+def test_template_renders_a_loadable_jellyfin_section_only_with_a_key(tmp_path):
+    import tomllib
+
+    from pireplace.config import load_jellyfin_config
+
+    with_key = _render_config({"pireplace_jellyfin_api_key": "s3cret-key"}, tmp_path)
+    data = tomllib.loads(with_key.read_text())
+    assert "s3cret-key" not in with_key.read_text()
+    assert set(data["jellyfin"]) == {"url", "user_id", "api_key_file", "playlists"}
+    cfg = load_jellyfin_config(with_key)
+    assert cfg.url == "http://100.88.8.6:8096"
+    assert cfg.user_id == "1b7ed00cbdcc4a1eb624738191ca4efd"
+    assert str(cfg.api_key_file) == "/etc/pireplace/jellyfin.key"
+    assert cfg.playlists == {
+        "modern": "385d9e4b0602d3d75a00bc6d31dc5aa6",
+        "classic-swing": "dfbf231b1aaa92df17ff5248fbde6fbf",
+        "soul-motown": "352617a64fc727e324fd1bfa625cb0f6",
+        "instrumental": "a371cfe3e0f01be7542358ad2f50f7b5",
+    }
+
+    for n, extra in enumerate(({}, {"pireplace_jellyfin_api_key": ""})):
+        directory = tmp_path / f"without{n}"
+        directory.mkdir()
+        plain = _render_config(extra, directory)
+        assert "jellyfin" not in tomllib.loads(plain.read_text())
+        assert load_jellyfin_config(plain) is None
