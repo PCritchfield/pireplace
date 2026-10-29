@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from pireplace.controller import UnknownMood
+from pireplace.controller import EmptySeason, UnknownMood, UnknownSeason
 from pireplace.mpv import MpvUnavailable
 from pireplace.web import make_server
 
@@ -53,6 +53,9 @@ class StubFireplace:
 
     def set_mood(self, name):
         self._enter("set_mood", True, name)
+
+    def set_season(self, name):
+        self._enter("set_season", True, name)
 
     def play(self):
         self._enter("play", True)
@@ -180,6 +183,9 @@ def test_unknown_path_is_404(srv):
         ("/api/mood", b'{"mood": 3}'),
         ("/api/mood", b'{"mood": ""}'),
         ("/api/mood", b'["modern"]'),
+        ("/api/season", b"{}"),
+        ("/api/season", b'{"season": 3}'),
+        ("/api/season", b'{"season": ""}'),
         ("/api/music", b'{"action": "dance"}'),
         ("/api/music", b"{}"),
         ("/api/volume", b'{"target": "music", "level": "loud"}'),
@@ -455,3 +461,50 @@ def test_index_page_disables_transitions_for_reduced_motion():
     _, css = _index_css()
     block = css.split("@media (prefers-reduced-motion: reduce)")[1]
     assert "transition: none" in block
+
+
+def test_post_season_switches(srv):
+    assert post(srv, "/api/season", {"season": "fall"}) == (200, STUB_STATUS)
+    assert srv.stub.calls == [("set_season", "fall")]
+
+
+def test_post_season_unknown_is_400(srv):
+    srv.stub.raise_on("set_season", UnknownSeason("spring"))
+    assert post(srv, "/api/season", {"season": "spring"}) == (400, {"error": "unknown season: spring"})
+
+
+def test_post_season_empty_is_409_with_message(srv):
+    srv.stub.raise_on("set_season", EmptySeason("Winter"))
+    assert post(srv, "/api/season", {"season": "winter"}) == (
+        409, {"error": "No music in Winter yet; it arrives with the next sync."})
+
+
+def test_post_season_requires_json(srv):
+    code, _, _ = request(srv, "POST", "/api/season", b'{"season": "fall"}',
+                         headers={"Content-Type": "text/plain"})
+    assert code == 415 and srv.stub.calls == []
+
+
+def test_index_has_all_twelve_palette_keys_in_themes():
+    html, css = _index_css()
+    themes = html.split("var THEMES = {")[1].split("var THEME")[0]
+    moods = ("classic-swing", "modern", "soul-motown", "instrumental",
+             "spooky-classics", "monster-party", "graveyard-punk", "goth-night",
+             "harvest", "thanksgiving", "autumn-standards", "four-seasons")
+    for mood in moods:
+        assert f'"{mood}": {{ icon:' in themes
+        assert f'[data-palette="{mood}"]' in css
+
+
+def test_index_has_season_picker_markup():
+    html, _ = _index_css()
+    assert "aria-haspopup" in html
+    assert "aria-expanded" in html
+    assert '"/api/season"' in html
+
+
+def test_season_menu_closes_on_an_outside_pointerdown():
+    """iOS Safari may not send click for taps on non-interactive areas."""
+    html, _ = _index_css()
+    assert 'document.addEventListener("pointerdown"' in html
+    assert 'document.addEventListener("click"' not in html

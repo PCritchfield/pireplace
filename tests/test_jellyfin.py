@@ -106,13 +106,22 @@ def test_truncated_download_removes_dest(fake, tmp_path):
     assert not dest.exists()
 
 
-def test_download_http_error_removes_preexisting_dest(fake, tmp_path):
+def test_download_http_error_leaves_preexisting_dest(fake, tmp_path):
     dest = tmp_path / ".part"
     dest.write_bytes(b"stale")
     with pytest.raises(JellyfinError) as e:
-        client(fake).download("z" * 32, dest)  # 404
+        client(fake).download("f" * 32, dest)  # 404
     assert "404" in str(e.value) and fake.key not in str(e.value)
-    assert not dest.exists()
+    assert dest.read_bytes() == b"stale"
+
+
+def test_download_existing_dest_is_not_deleted(fake, tmp_path):
+    fake.files["a" * 32] = b"x" * 10
+    dest = tmp_path / ".part"
+    dest.write_bytes(b"mine")
+    with pytest.raises(JellyfinError):
+        client(fake).download("a" * 32, dest)
+    assert dest.read_bytes() == b"mine"
 
 
 def test_unreachable_server_is_jellyfin_error(tmp_path):
@@ -202,3 +211,172 @@ def test_download_never_writes_through_an_existing_symlink(fake, tmp_path):
     with pytest.raises(JellyfinError):
         client(fake).download("a" * 32, dest)
     assert victim.read_text() == "keep"
+
+
+def test_track_duration_from_runtime_ticks(fake):
+    a, b, c = "a" * 32, "b" * 32, "c" * 32
+    fake.playlists[PL] = [
+        {**item(a, "x", "t", "flac", 1), "RunTimeTicks": 2_400_000_000},
+        item(b, "x", "t", "flac", 1),
+        {**item(c, "x", "t", "flac", 1), "RunTimeTicks": True},
+    ]
+    tracks = client(fake).playlist_tracks(PL)
+    assert [t.duration_s for t in tracks] == [240.0, None, None]
+
+
+def test_track_duration_rejects_non_positive_and_non_int():
+    from pireplace.jellyfin import _track
+
+    base = item("a" * 32, "x", "t", "flac", 1)
+    for bad in (0, -5, "100", 1.5, None):
+        assert _track({**base, "RunTimeTicks": bad}).duration_s is None
+
+
+def test_transcoded_download_writes_ogg(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 1000
+    dest = tmp_path / ".part"
+    assert client(fake).download_transcoded("a" * 32, dest, 160) == 1004
+    assert dest.read_bytes() == b"OggS" + b"x" * 1000
+    parts = urlsplit(fake.requests[-1][0])
+    assert parts.path == f"/Audio/{'a' * 32}/stream.ogg"
+    q = parse_qs(parts.query)
+    assert q["audioCodec"] == ["opus"] and q["audioBitRate"] == ["160000"]
+    assert q["static"] == ["false"] and q["audioChannels"] == ["2"] and q["userId"] == [USER]
+    assert fake.requests[-1][1]["Authorization"] == f'MediaBrowser Token="{fake.key}"'
+
+
+def test_transcoded_download_accepts_content_type_parameters(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 10
+    fake.transcode_type["a" * 32] = "audio/ogg; codecs=opus"
+    assert client(fake).download_transcoded("a" * 32, tmp_path / ".part", 128) == 14
+
+
+def test_transcoded_download_rejects_non_ogg_body(fake, tmp_path):
+    dest = tmp_path / ".part"
+    fake.html.add(f"/Audio/{'a' * 32}/stream.ogg")
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert not dest.exists()
+    fake.transcodes["b" * 32] = b"<html>"
+    fake.transcode_type["b" * 32] = "audio/ogg"
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("b" * 32, dest, 160)
+    assert not dest.exists()
+    fake.transcodes["c" * 32] = b"OggS" + b"x" * 10
+    fake.transcode_type["c" * 32] = "text/html"
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("c" * 32, dest, 160)
+    assert not dest.exists()
+
+
+def test_transcoded_download_rejects_short_body(fake, tmp_path):
+    dest = tmp_path / ".part"
+    fake.transcodes["a" * 32] = b"Og"
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert not dest.exists()
+
+
+def test_transcoded_download_truncated_removes_dest(fake, tmp_path):
+    dest = tmp_path / ".part"
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 1000
+    fake.truncate.add("a" * 32)
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert not dest.exists()
+
+
+def test_transcoded_download_http_error_has_no_secrets(fake, tmp_path):
+    path = f"/Audio/{'a' * 32}/stream.ogg"
+    fake.fail[path] = 403
+    dest = tmp_path / ".part"
+    dest.write_bytes(b"stale")
+    with pytest.raises(JellyfinError) as e:
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    msg = str(e.value)
+    assert "403" in msg and fake.key not in msg and "audioBitRate" not in msg
+    assert e.value.__cause__ is None and dest.read_bytes() == b"stale"
+
+
+def test_transcoded_download_never_follows_redirect(fake, tmp_path):
+    with FakeJellyfin() as other:
+        other.key = fake.key
+        other.transcodes["a" * 32] = b"OggS" + b"x" * 10
+        fake.redirects[f"/Audio/{'a' * 32}/stream.ogg"] = other.url + f"/Audio/{'a' * 32}/stream.ogg"
+        dest = tmp_path / ".part"
+        with pytest.raises(JellyfinError):
+            client(fake).download_transcoded("a" * 32, dest, 160)
+        assert not dest.exists()
+        assert other.requests == []
+
+
+def test_transcoded_download_hits_the_deadline(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 400
+    fake.trickle["a" * 32] = 0.05
+    c = JellyfinClient(fake.url, fake.key, USER, timeout=5.0, download_deadline=0.2)
+    dest = tmp_path / ".part"
+    with pytest.raises(JellyfinError):
+        c.download_transcoded("a" * 32, dest, 160)
+    assert not dest.exists()
+
+
+def test_transcoded_download_is_fsynced_and_never_follows_symlink(fake, tmp_path, monkeypatch):
+    import pireplace.jellyfin as jf
+
+    synced = []
+    real = jf.os.fsync
+    monkeypatch.setattr(jf.os, "fsync", lambda fd: synced.append(fd) or real(fd))
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 10
+    client(fake).download_transcoded("a" * 32, tmp_path / ".part", 160)
+    assert len(synced) == 1
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    dest = tmp_path / ".link"
+    dest.symlink_to(victim)
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert victim.read_text() == "keep"
+
+
+def test_transcoded_download_over_max_bytes_aborts(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 5000
+    dest = tmp_path / ".part"
+    with pytest.raises(JellyfinError) as e:
+        client(fake).download_transcoded("a" * 32, dest, 160, max_bytes=1000)
+    assert "audioBitRate" not in str(e.value)
+    assert not dest.exists()
+
+
+def test_transcoded_content_type_reject_leaves_preexisting_dest(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 10
+    fake.transcode_type["a" * 32] = "text/html"
+    dest = tmp_path / ".part"
+    dest.write_bytes(b"mine")
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert dest.read_bytes() == b"mine"
+
+
+def test_transcoded_existing_dest_is_not_deleted(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 10
+    dest = tmp_path / ".part"
+    dest.write_bytes(b"mine")
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert dest.read_bytes() == b"mine"
+
+
+@pytest.mark.parametrize("bad", ["..", "a/b", "", "z" * 32, "a" * 31, "a" * 33])
+def test_downloads_reject_bad_item_ids_without_a_request(fake, tmp_path, bad):
+    with pytest.raises(JellyfinError):
+        client(fake).download(bad, tmp_path / "d1")
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded(bad, tmp_path / "d2", 160)
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("bad", [True, 31, 513, 0, -1, 160.0, "160", None])
+def test_transcoded_download_rejects_bad_bitrate_without_a_request(fake, tmp_path, bad):
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, tmp_path / ".part", bad)
+    assert fake.requests == []

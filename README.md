@@ -89,6 +89,46 @@ get a little static snow). Any other mood, or no mood, shows the warm fire colou
 ssh <user>@pireplace.local mkdir /srv/pireplace/music/christmas
 ```
 
+## Seasons
+
+Moods are grouped into seasons. With seasons defined, the control page's title becomes a
+season picker ("Fireplace ▾"): tap it, pick a season, and the mood buttons show that
+season's moods. Picking a season starts its first mood that has tracks, exactly as
+tapping that mood would; nothing ever switches season by itself. With no seasons (or
+only one) there is no picker and the page behaves as before.
+
+With the Jellyfin sync on, the deploy defaults are Fall (`harvest`, `thanksgiving`, `autumn-standards`,
+`four-seasons`), Halloween (`spooky-classics`, `monster-party`, `graveyard-punk`,
+`goth-night`) and Winter (`classic-swing`, `modern`, `soul-motown`, `instrumental`),
+in that order (without the sync there are no default seasons). To define your own, set `pireplace_seasons_custom` in a vars file
+(`-e @seasons.yml`), in display order; `[]` turns the picker off:
+
+```yaml
+pireplace_seasons_custom:
+  - name: summer          # lowercase letters, digits and -
+    label: Summer
+    moods: [beach, barbecue]
+```
+
+Each mood belongs to at most one season, and must be a playlist in
+`pireplace_jellyfin_playlists` (sync on) or listed in `pireplace_moods`; the deploy
+checks names, labels and moods before it changes anything. Music folders that are in no
+season show up under an automatic "Other" season, so `other` is not a valid season
+name. This renders `[seasons.<name>]` tables (`label`, `moods`) in `/etc/pireplace/config.toml`; table order is display order. The
+current season is the one holding the current mood (else `default_mood`, else the first
+season).
+
+**Opus audio.** The nightly sync now asks Jellyfin to transcode every track to Opus
+(`audio_format = "opus"`, `audio_bitrate_kbps = 160`; override with
+`pireplace_jellyfin_audio_format` = `opus` or `original`, and
+`pireplace_jellyfin_audio_bitrate_kbps` = 64 to 320). The Jellyfin user the Pi syncs as
+needs **audio transcoding allowed** (in the user's Jellyfin Playback permissions, the audio-transcoding
+option); if it is refused, that mood reports an error and
+keeps its existing files. **One-time migration:** the first sync after the deploy
+replaces each mood's FLAC files with Opus, one mood at a time (download before delete),
+so run it with the Pi on the tailnet and expect all twelve moods to settle at about
+3 GB.
+
 ## Music from Jellyfin
 
 The Pi can fill its mood folders from Jellyfin playlists every night, over Tailscale.
@@ -168,15 +208,18 @@ than 15 minutes is given up and retried later. After a run that added or removed
 the sync asks the control page to rescan, so new music shows up without a button press.
 A rescan reshuffles the current mood, so while music is playing (or if the control page
 does not answer) it waits: it leaves `/srv/pireplace/music/.pireplace-rescan-pending`
-and a later run rescans once the music is paused. If the server is unreachable the run
+and a later run rescans once the music is paused. Files are deleted the same way (a
+track taken off a playlist, a FLAC replaced by its Opus copy): only when music is known
+to be paused, since the player may still be holding them; until then they stay on the
+card and a later run deletes them and rescans. If the server is unreachable the run
 fails cleanly and the music keeps playing; a failed run is retried every 10 minutes, up
 to 4 times, before it waits for the next night (a config error is not retried).
 
 **Add a mood.** Create a playlist in Jellyfin (shared with the sync user in the create
-call, see step 1, or public), then
-add `name: <playlist Id>` to `pireplace_jellyfin_playlists` (keep the existing four,
-since the map replaces the default) and deploy; the folder is created and the next sync
-fills it. Mood names are lowercase letters, digits and `-`.
+call, see step 1, or public), then add `name: <playlist Id>` to
+`pireplace_jellyfin_playlists` (keep the existing twelve, since the map replaces the
+default), put the mood in a season (see "Seasons") and deploy; the folder is created
+and the next sync fills it. Mood names are lowercase letters, digits and `-`.
 
 **Retire a mood.** Remove it from the map and deploy. Its folder and files stay on the
 Pi, so delete them by hand (`rm -r /srv/pireplace/music/<mood>`) and press Rescan.

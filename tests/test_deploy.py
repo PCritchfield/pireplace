@@ -629,6 +629,84 @@ def _render_config(extra: dict, directory: Path) -> Path:
     return out
 
 
+EXPECTED_PLAYLISTS = {
+    "harvest": "2468e8f94e04ea7cd30bc7e07e2cf723",
+    "thanksgiving": "e8fccbd51d0366b8e01c7c559280a23e",
+    "autumn-standards": "8168bbe27de41b39641c7decf353feac",
+    "four-seasons": "bff6a0a9d940b5422c8c632c4bea3946",
+    "spooky-classics": "c2a72fb4b5e405f93e0f49073ff5465d",
+    "monster-party": "99994b20b9e956085b7e570729cb9cf1",
+    "graveyard-punk": "dd675304017333b0dd2e8cdd8122719f",
+    "goth-night": "ce2cc8851c29a131ba05149e04fceb02",
+    "classic-swing": "f4b96696936ec335bfeca0c623ad0669",
+    "modern": "dc8d8d54ecad68b2546b5c7c9b4b4766",
+    "soul-motown": "79525d419fccb3bec7c38cef5fe07b11",
+    "instrumental": "30bf4d0f66600b1d1dd8cded00e25705",
+}
+OWNER_SEASONS = [
+    ("fall", "Fall", ["harvest", "thanksgiving", "autumn-standards", "four-seasons"]),
+    ("halloween", "Halloween",
+     ["spooky-classics", "monster-party", "graveyard-punk", "goth-night"]),
+    ("winter", "Winter", ["classic-swing", "modern", "soul-motown", "instrumental"]),
+]
+
+
+def test_default_playlists_include_fall_and_halloween():
+    defaults = yaml.safe_load(SITE)[1]["vars"]["pireplace_jf_default_playlists"]
+    assert list(defaults.items()) == list(EXPECTED_PLAYLISTS.items())
+
+
+def test_template_renders_seasons_in_order(tmp_path):
+    from pireplace.config import load_config
+
+    path = _render_config({"pireplace_jellyfin_api_key": "k"}, tmp_path)
+    cfg = load_config(path)
+    assert [(s.name, s.label, list(s.moods)) for s in cfg.seasons] == OWNER_SEASONS
+    text = path.read_text()
+    assert text.index("[playback]") < text.index("[seasons.fall]")
+    assert text.index("[seasons.fall]") < text.index("[seasons.halloween]") < text.index(
+        "[seasons.winter]"
+    )
+
+
+def test_template_renders_seasons_from_an_inventory_override(tmp_path):
+    from pireplace.config import load_config
+
+    custom = [{"name": "summer", "label": "Summer", "moods": ["beach"]}]
+    cfg = load_config(_render_config({"pireplace_seasons_custom": custom}, tmp_path))
+    assert [(s.name, s.label, list(s.moods)) for s in cfg.seasons] == [("summer", "Summer", ["beach"])]
+
+
+def test_default_seasons_need_the_sync(tmp_path):
+    from pireplace.config import load_config
+
+    assert load_config(_render_config({}, tmp_path)).seasons == ()
+
+
+def test_template_omits_seasons_when_empty(tmp_path):
+    import tomllib
+
+    from pireplace.config import load_config
+
+    path = _render_config({"pireplace_seasons_custom": []}, tmp_path)
+    assert "seasons" not in tomllib.loads(path.read_text())
+    assert load_config(path).seasons == ()
+
+
+def test_template_renders_audio_profile(tmp_path):
+    from pireplace.config import load_jellyfin_config
+
+    cfg = load_jellyfin_config(_render_config({"pireplace_jellyfin_api_key": "k"}, tmp_path))
+    assert (cfg.audio_format, cfg.audio_bitrate_kbps) == ("opus", 160)
+
+    other = tmp_path / "other"
+    other.mkdir()
+    cfg = load_jellyfin_config(_render_config(
+        {"pireplace_jellyfin_api_key": "k", "pireplace_jellyfin_audio_format": "original",
+         "pireplace_jellyfin_audio_bitrate_kbps": 96}, other))
+    assert (cfg.audio_format, cfg.audio_bitrate_kbps) == ("original", 96)
+
+
 def test_template_renders_a_loadable_jellyfin_section_only_with_a_key(tmp_path):
     import tomllib
 
@@ -637,17 +715,14 @@ def test_template_renders_a_loadable_jellyfin_section_only_with_a_key(tmp_path):
     with_key = _render_config({"pireplace_jellyfin_api_key": "s3cret-key"}, tmp_path)
     data = tomllib.loads(with_key.read_text())
     assert "s3cret-key" not in with_key.read_text()
-    assert set(data["jellyfin"]) == {"url", "user_id", "api_key_file", "playlists"}
+    assert set(data["jellyfin"]) == {
+        "url", "user_id", "api_key_file", "playlists", "audio_format", "audio_bitrate_kbps",
+    }
     cfg = load_jellyfin_config(with_key)
     assert cfg.url == "http://100.88.8.6:8096"
     assert cfg.user_id == "4640835a50a94bc69709d00d6f332fac"
     assert str(cfg.api_key_file) == "/etc/pireplace/jellyfin.key"
-    assert cfg.playlists == {
-        "modern": "dc8d8d54ecad68b2546b5c7c9b4b4766",
-        "classic-swing": "f4b96696936ec335bfeca0c623ad0669",
-        "soul-motown": "79525d419fccb3bec7c38cef5fe07b11",
-        "instrumental": "30bf4d0f66600b1d1dd8cded00e25705",
-    }
+    assert cfg.playlists == EXPECTED_PLAYLISTS
 
     for n, extra in enumerate(({}, {"pireplace_jellyfin_api_key": ""})):
         directory = tmp_path / f"without{n}"
@@ -891,3 +966,118 @@ def test_first_profile_backup_cannot_fail_the_play_and_runs_after_the_services()
     first = names.index("Back up the NetworkManager profiles once now")
     assert first > names.index("Enable and start the control page and Wi-Fi watcher")
     assert tasks[first]["failed_when"] is False and "register" in tasks[first]
+
+
+def _seasons_checks(extra: dict) -> dict:
+    """Evaluate the `that` conditions of the two season pre-flight asserts."""
+    templar, trust = _templar(extra)
+    out = {}
+    for name in ("Require valid seasons", "Require a source for every season mood"):
+        for cond in _task(name)["ansible.builtin.assert"]["that"]:
+            out[cond] = templar.template(trust("{{ " + cond + " }}"))
+    return out
+
+
+def _failing(extra: dict) -> list[str]:
+    return [c for c, v in _seasons_checks(extra).items() if v is not True]
+
+
+def _custom(moods=("harvest",), name="x", label="X", **extra):
+    seasons = [{"name": name, "label": label, "moods": list(moods)}]
+    return {"pireplace_seasons_custom": seasons, **extra}
+
+
+def test_season_preflight_passes_for_the_defaults():
+    for sync in ({}, {"pireplace_jellyfin_api_key": "k"}):  # off: no default seasons at all
+        results = _seasons_checks(sync)
+        assert results and all(v is True for v in results.values()), results
+
+
+@pytest.mark.parametrize("name", ["Fall", "-a", "a_b", "", "a b", "a\n"])
+def test_season_preflight_rejects_a_bad_season_name(name):
+    assert any("bad_names" in c for c in _failing(_custom(name=name, moods=["modern"])))
+
+
+def test_season_preflight_reserves_the_name_other():
+    """"other" is the automatic bucket for folders in no season."""
+    assert any("bad_names" in c for c in _failing(_custom(name="other", moods=["modern"])))
+    assert not _failing(_custom(name="others", moods=["modern"]))
+
+
+def _audio_checks(extra: dict) -> list:
+    templar, trust = _templar({"pireplace_jellyfin_api_key": "k", **extra})
+    task = _task("Require a valid Jellyfin audio format")
+    assert templar.template(trust("{{ " + task["when"] + " }}")) is True
+    return [templar.template(trust("{{ " + c + " }}"))
+            for c in task["ansible.builtin.assert"]["that"]]
+
+
+def test_audio_preflight_only_runs_with_the_sync():
+    templar, trust = _templar({})
+    task = _task("Require a valid Jellyfin audio format")
+    assert templar.template(trust("{{ " + task["when"] + " }}")) is False
+
+
+@pytest.mark.parametrize("extra", [
+    {},
+    {"pireplace_jellyfin_audio_format": "original"},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 64},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 320},
+    {"pireplace_jellyfin_audio_bitrate_kbps": "96"},  # -e on the command line is a string
+])
+def test_audio_preflight_accepts_valid_settings(extra):
+    assert all(v is True for v in _audio_checks(extra))
+
+
+@pytest.mark.parametrize("extra", [
+    {"pireplace_jellyfin_audio_format": "mp3"},
+    {"pireplace_jellyfin_audio_format": "Opus"},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 63},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 321},
+    {"pireplace_jellyfin_audio_bitrate_kbps": "abc"},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 96.5},
+    {"pireplace_jellyfin_audio_bitrate_kbps": True},
+])
+def test_audio_preflight_rejects_bad_settings(extra):
+    assert not all(v is True for v in _audio_checks(extra))
+
+
+@pytest.mark.parametrize("label", ["", "   ", 5])
+def test_season_preflight_rejects_a_bad_label(label):
+    assert any("bad_labels" in c for c in _failing(_custom(label=label, moods=["modern"])))
+
+
+@pytest.mark.parametrize("mood", ["Harvest", "-x", "a_b", ""])
+def test_season_preflight_rejects_a_bad_mood_name(mood):
+    assert any("bad_moods" in c for c in _failing(_custom(moods=[mood])))
+
+
+def test_season_preflight_rejects_empty_moods_and_a_mood_in_two_seasons():
+    assert _failing(_custom(moods=[]))
+    two = {"pireplace_seasons_custom": [
+        {"name": "a", "label": "A", "moods": ["modern"]},
+        {"name": "b", "label": "B", "moods": ["modern"]},
+    ]}
+    assert _failing(two)
+
+
+def test_season_preflight_rejects_moods_with_no_source():
+    # Sync off: sources are pireplace_moods (modern, classic-swing) only.
+    assert _failing(_custom(moods=["harvest"]))
+    assert not _failing(_custom(moods=["modern"]))
+    # Sync on: sources are the playlist keys.
+    on = {"pireplace_jellyfin_api_key": "k"}
+    assert not _failing(_custom(moods=["harvest"], **on))
+    assert _failing(_custom(moods=["nowhere"], **on))
+    only = {"pireplace_jellyfin_playlists": {"beach": "0" * 32}}
+    assert _failing(_custom(moods=["harvest"], **on, **only))
+
+
+def test_template_keeps_non_ascii_and_quoted_labels_valid(tmp_path):
+    from pireplace.config import load_config
+
+    for n, label in enumerate(["🎃 Halloween", 'Say "hi" \\ back']):
+        directory = tmp_path / str(n)
+        directory.mkdir()
+        cfg = load_config(_render_config(_custom(label=label, moods=["modern"]), directory))
+        assert cfg.seasons[0].label == label

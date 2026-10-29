@@ -92,10 +92,57 @@
     pireplace_jf_user_id: "{{ pireplace_jellyfin_user_id | default('4640835a50a94bc69709d00d6f332fac') }}"
     pireplace_jf_playlists: "{{ pireplace_jellyfin_playlists | default(pireplace_jf_default_playlists) }}"
     pireplace_jf_default_playlists:
-      modern: dc8d8d54ecad68b2546b5c7c9b4b4766
+      harvest: 2468e8f94e04ea7cd30bc7e07e2cf723
+      thanksgiving: e8fccbd51d0366b8e01c7c559280a23e
+      autumn-standards: 8168bbe27de41b39641c7decf353feac
+      four-seasons: bff6a0a9d940b5422c8c632c4bea3946
+      spooky-classics: c2a72fb4b5e405f93e0f49073ff5465d
+      monster-party: 99994b20b9e956085b7e570729cb9cf1
+      graveyard-punk: dd675304017333b0dd2e8cdd8122719f
+      goth-night: ce2cc8851c29a131ba05149e04fceb02
       classic-swing: f4b96696936ec335bfeca0c623ad0669
+      modern: dc8d8d54ecad68b2546b5c7c9b4b4766
       soul-motown: 79525d419fccb3bec7c38cef5fe07b11
       instrumental: 30bf4d0f66600b1d1dd8cded00e25705
+    # Audio the sync stores: "opus" (Jellyfin transcodes, about 3 GB for all twelve moods)
+    # or "original" (files as uploaded). Optional inventory vars pireplace_jellyfin_audio_format
+    # and pireplace_jellyfin_audio_bitrate_kbps (64-320, opus only).
+    pireplace_jf_audio_format: "{{ pireplace_jellyfin_audio_format | default('opus') }}"
+    pireplace_jf_audio_bitrate_kbps: "{{ pireplace_jellyfin_audio_bitrate_kbps | default(160) }}"
+    # Seasons: the control page's season picker, in display order. Optional inventory
+    # override pireplace_seasons_custom (same shape; an empty list turns the picker off).
+    # The default seasons need the synced playlists, so without the sync there are none.
+    pireplace_seasons: "{{ pireplace_seasons_custom | default(pireplace_seasons_default if pireplace_jf_enabled else []) }}"
+    # Pre-flight checks over pireplace_seasons (the same rules as config.py _parse_seasons).
+    pireplace_seasons_moods: "{{ pireplace_seasons | map(attribute='moods', default=[]) | list }}"
+    pireplace_seasons_all_moods: "{{ pireplace_seasons_moods | select('sequence') | reject('string') | flatten }}"
+    pireplace_seasons_bad_names: >-
+      {{ pireplace_seasons | map(attribute='name', default='') | reject('string') | list
+         + pireplace_seasons | map(attribute='name', default='') | select('string')
+           | reject('match', '^[a-z0-9][a-z0-9-]*$(?!\n)') | list
+         + pireplace_seasons | map(attribute='name', default='') | select('equalto', 'other') | list }}
+    pireplace_seasons_bad_labels: >-
+      {{ pireplace_seasons | map(attribute='label', default='') | reject('string') | list
+         + pireplace_seasons | map(attribute='label', default='') | select('string')
+           | map('trim') | select('equalto', '') | list }}
+    pireplace_seasons_bad_moods: >-
+      {{ pireplace_seasons_all_moods | reject('string') | list
+         + pireplace_seasons_all_moods | select('string')
+           | reject('match', '^[a-z0-9][a-z0-9-]*$(?!\n)') | list }}
+    pireplace_seasons_unsourced: >-
+      {{ pireplace_seasons_all_moods
+         | reject('in', (pireplace_jf_playlists.keys() | list) if pireplace_jf_enabled else pireplace_moods)
+         | list }}
+    pireplace_seasons_default:
+      - name: fall
+        label: Fall
+        moods: [harvest, thanksgiving, autumn-standards, four-seasons]
+      - name: halloween
+        label: Halloween
+        moods: [spooky-classics, monster-party, graveyard-punk, goth-night]
+      - name: winter
+        label: Winter
+        moods: [classic-swing, modern, soul-motown, instrumental]
     pireplace_sync_units:
       - pireplace-sync.service
       - pireplace-sync.timer
@@ -140,6 +187,52 @@
           allowed to connect to that address.
         quiet: true
       when: pireplace_jf_enabled
+
+    - name: Require valid seasons (names, labels, moods; no mood in two seasons)
+      ansible.builtin.assert:
+        that:
+          - pireplace_seasons is sequence and pireplace_seasons is not string and pireplace_seasons is not mapping
+          - pireplace_seasons_bad_names | length == 0
+          - pireplace_seasons_bad_labels | length == 0
+          - pireplace_seasons_moods | select('string') | list | length == 0
+          - pireplace_seasons_moods | map('length') | select('equalto', 0) | list | length == 0
+          - pireplace_seasons_bad_moods | length == 0
+          - pireplace_seasons_all_moods | length == pireplace_seasons_all_moods | unique | list | length
+        fail_msg: >-
+          pireplace_seasons (pireplace_seasons_custom) is invalid. It must be a list of
+          {name, label, moods}; every name and mood is lowercase letters, digits and -
+          (starting with a letter or digit); no season is named "other" (reserved for
+          folders in no season); every label is non-empty; every season has
+          a non-empty list of moods; and a mood is in at most one season.
+          Bad names: {{ pireplace_seasons_bad_names }}. Bad labels (empty or not text):
+          {{ pireplace_seasons_bad_labels }}. Bad mood names: {{ pireplace_seasons_bad_moods }}.
+          All moods listed (look for a repeat): {{ pireplace_seasons_all_moods }}.
+        quiet: true
+
+    - name: Require a valid Jellyfin audio format and bitrate (the same rules as config.py)
+      ansible.builtin.assert:
+        that:
+          - pireplace_jf_audio_format in ['opus', 'original']
+          - pireplace_jf_audio_bitrate_kbps is not boolean
+          - (pireplace_jf_audio_bitrate_kbps | string) is match('^[0-9]+$(?!\n)')
+          - (pireplace_jf_audio_bitrate_kbps | int) >= 64
+          - (pireplace_jf_audio_bitrate_kbps | int) <= 320
+        fail_msg: >-
+          pireplace_jellyfin_audio_format must be "opus" or "original" (got
+          {{ pireplace_jf_audio_format }}) and pireplace_jellyfin_audio_bitrate_kbps a whole
+          number from 64 to 320 (got {{ pireplace_jf_audio_bitrate_kbps }}).
+        quiet: true
+      when: pireplace_jf_enabled
+
+    - name: Require a source for every season mood (a playlist, or a pireplace_moods folder)
+      ansible.builtin.assert:
+        that:
+          - pireplace_seasons_unsourced | length == 0
+        fail_msg: >-
+          These season moods have no source: {{ pireplace_seasons_unsourced }}. With the
+          Jellyfin sync on, each must be a key of pireplace_jellyfin_playlists; otherwise
+          each must be listed in pireplace_moods.
+        quiet: true
 
     # --- identity and packages -------------------------------------------------
 

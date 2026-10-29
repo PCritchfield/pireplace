@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from pireplace.config import Config
-from pireplace.controller import Fireplace, UnknownMood
+from pireplace.config import Config, Season
+from pireplace.controller import EmptySeason, Fireplace, UnknownMood, UnknownSeason
 from pireplace.library import find_moods
 from pireplace.mpv import MpvClient, MpvUnavailable
 from pireplace.state import State, StateStore
@@ -43,7 +43,8 @@ def _touch(root: Path, tree: dict) -> None:
 def env_factory(tmp_path):
     stack = []
 
-    def make(start_music=True, music_tree=None, video_tree=None) -> Env:
+    def make(start_music=True, music_tree=None, video_tree=None, seasons=(),
+             default_mood="classic-swing") -> Env:
         music_dir, video_dir = tmp_path / "music", tmp_path / "videos"
         music_dir.mkdir()
         video_dir.mkdir()
@@ -55,7 +56,7 @@ def env_factory(tmp_path):
             video_dir=video_dir, music_dir=music_dir,
             video_socket=run_dir / "v.sock", music_socket=run_dir / "m.sock",
             state_file=tmp_path / "state.json", start_music=start_music,
-            default_mood="classic-swing", music_volume=60, log_volume=40,
+            default_mood=default_mood, seasons=tuple(seasons), music_volume=60, log_volume=40,
             host="127.0.0.1", port=8080, hotspot_ssid="x", hotspot_password="",
             hotspot_after_s=300, hotspot_retry_s=300,
         )
@@ -319,6 +320,8 @@ def test_status_shape(env):
         "mood": "classic-swing",
         "music": {"available": True, "playing": True, "volume": 60, "now_playing": "Song"},
         "log": {"available": True, "volume": 40, "muted": False, "videos": 2},
+        "season": None,
+        "seasons": [],
     }
 
 
@@ -414,3 +417,68 @@ def test_reconcile_empty_player_with_no_videos_sends_stop_not_loadfile(env_facto
     env = env_factory(video_tree={".hidden.mp4": b""})
     env.fp.reconcile()
     assert env.video.commands == [["stop"]]
+
+
+# -- seasons ---------------------------------------------------------------
+
+SEASON_TREE = {"harvest/a.mp3": b"", "thanksgiving/b.mp3": b"", "modern/c.mp3": b"",
+               "extra/d.mp3": b""}
+FALL = Season("fall", "Fall", ("harvest", "thanksgiving"))
+WINTER = Season("winter", "Winter", ("modern",))
+
+
+def test_status_without_seasons_is_unchanged(env):
+    s = env.fp.status()
+    assert s["seasons"] == [] and s["season"] is None
+    assert set(s) == {"moods", "mood", "music", "log", "season", "seasons"}
+    assert s["mood"] == "classic-swing"
+
+
+def test_status_reports_season_of_current_mood(env_factory):
+    e = env_factory(music_tree={"harvest/a.mp3": b"", "modern/c.mp3": b""},
+                    seasons=[FALL, WINTER], default_mood="harvest")
+    e.store.save(replace(e.defaults, mood="modern"))
+    s = e.fp.status()
+    assert s["season"] == "winter"
+    assert s["seasons"] == [{"name": "fall", "label": "Fall", "moods": ["harvest", "thanksgiving"]},
+                            {"name": "winter", "label": "Winter", "moods": ["modern"]}]
+
+
+def test_status_season_follows_default_mood_when_none_saved(env_factory):
+    e = env_factory(music_tree=SEASON_TREE, seasons=[FALL, WINTER], default_mood="modern")
+    e.store.save(replace(e.defaults, mood=None))
+    assert e.fp.status()["season"] == "winter"
+
+
+def test_status_puts_unlisted_mood_in_other_season(env_factory):
+    e = env_factory(music_tree=SEASON_TREE, seasons=[FALL, WINTER])
+    e.store.save(replace(e.defaults, mood="extra"))
+    s = e.fp.status()
+    assert s["seasons"][-1] == {"name": "other", "label": "Other", "moods": ["extra"]}
+    assert s["season"] == "other"
+
+
+def test_set_season_starts_first_mood(env_factory):
+    e = env_factory(music_tree=SEASON_TREE, seasons=[FALL, WINTER])
+    e.store.save(replace(e.defaults, music_playing=False))
+    e.fp.set_season("fall")
+    st = e.store.load()
+    assert st.mood == "harvest" and st.music_playing is True
+    assert e.music.props["pause"] is False
+
+
+def test_set_season_skips_empty_first_mood(env_factory):
+    tree = {k: v for k, v in SEASON_TREE.items() if not k.startswith("harvest")}
+    e = env_factory(music_tree=tree, seasons=[FALL, WINTER])
+    e.fp.set_season("fall")
+    assert e.store.load().mood == "thanksgiving"
+
+
+def test_set_season_unknown_and_empty(env_factory):
+    e = env_factory(music_tree={"modern/c.mp3": b""}, seasons=[FALL, WINTER])
+    with pytest.raises(UnknownSeason):
+        e.fp.set_season("spring")
+    with pytest.raises(EmptySeason) as ei:
+        e.fp.set_season("fall")
+    assert str(ei.value) == "Fall"
+    assert e.store.load().mood == "classic-swing"
