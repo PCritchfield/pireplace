@@ -381,7 +381,8 @@
   $("season-btn").addEventListener("click", function () {
     if (menuOpen) { closeMenu(false); } else { openMenu(); }
   });
-  document.addEventListener("click", function (e) {
+  // pointerdown, not click: iOS Safari may send no click for a tap on a plain area.
+  document.addEventListener("pointerdown", function (e) {
     if (menuOpen && !$("season-menu").contains(e.target) && !$("season-btn").contains(e.target)) {
       closeMenu(false);
     }

@@ -501,3 +501,10 @@ def test_index_has_season_picker_markup():
     assert "aria-haspopup" in html
     assert "aria-expanded" in html
     assert '"/api/season"' in html
+
+
+def test_season_menu_closes_on_an_outside_pointerdown():
+    """iOS Safari may not send click for taps on non-interactive areas."""
+    html, _ = _index_css()
+    assert 'document.addEventListener("pointerdown"' in html
+    assert 'document.addEventListener("click"' not in html
