@@ -320,6 +320,8 @@ def test_status_shape(env):
         "mood": "classic-swing",
         "music": {"available": True, "playing": True, "volume": 60, "now_playing": "Song"},
         "log": {"available": True, "volume": 40, "muted": False, "videos": 2},
+        "season": None,
+        "seasons": [],
     }
 
 
