@@ -171,16 +171,15 @@
   var dragging = {};        // slider id -> true while the user is adjusting it
   var timers = {};
 
-  // Palettes. THEMES maps a theme name to {mood name -> {bg, icon}}; the colours themselves
+  // Palettes. THEMES maps a theme name to {mood name -> {icon}}; the colours themselves
   // live in the CSS under body[data-theme][data-palette]. To add a theme (Thanksgiving,
   // Halloween...) add a table here, matching CSS blocks, and change THEME.
-  var DEFAULT_BG = "#1a0f0a";  // keep in step with --bg in :root
   var THEMES = {
     christmas: {
-      "classic-swing": { bg: "#3b0d12", icon: '<svg viewBox="0 0 32 32" width="32" height="32"><circle cx="16" cy="18" r="10" fill="#c9302c"/><path d="M16 8v-3m-4 2h8" stroke="#d4a63a" stroke-width="2.5" stroke-linecap="round"/><path d="M9 16q7 4 14 0" stroke="#d4a63a" stroke-width="1.6" fill="none"/></svg>' },
-      "modern": { bg: "#0f2238", icon: '<svg viewBox="0 0 32 32" width="32" height="32"><g stroke="#dfe9f5" stroke-width="2" stroke-linecap="round"><path d="M16 4v24M5.6 10l20.8 12M5.6 22l20.8-12"/><path d="M13 6l3 3 3-3M13 26l3-3 3 3"/></g></svg>' },
-      "soul-motown": { bg: "#2b1430", icon: '<svg viewBox="0 0 32 32" width="32" height="32"><circle cx="16" cy="16" r="12" fill="#111"/><circle cx="16" cy="16" r="8.5" fill="none" stroke="#333"/><circle cx="16" cy="16" r="4" fill="#e0a14d"/><circle cx="16" cy="16" r="1" fill="#111"/></svg>' },
-      "instrumental": { bg: "#13281c", icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 3l7 10h-4l6 8h-5l5 7H7l5-7H7l6-8H9z" fill="#2f7a4b"/><rect x="14" y="27" width="4" height="3" fill="#7a4a24"/><circle cx="16" cy="3" r="2" fill="#e9d9a8"/></svg>' }
+      "classic-swing": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><circle cx="16" cy="18" r="10" fill="#c9302c"/><path d="M16 8v-3m-4 2h8" stroke="#d4a63a" stroke-width="2.5" stroke-linecap="round"/><path d="M9 16q7 4 14 0" stroke="#d4a63a" stroke-width="1.6" fill="none"/></svg>' },
+      "modern": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><g stroke="#dfe9f5" stroke-width="2" stroke-linecap="round"><path d="M16 4v24M5.6 10l20.8 12M5.6 22l20.8-12"/><path d="M13 6l3 3 3-3M13 26l3-3 3 3"/></g></svg>' },
+      "soul-motown": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><circle cx="16" cy="16" r="12" fill="#111" stroke="#ff8a8a" stroke-width="1.5"/><circle cx="16" cy="16" r="8.5" fill="none" stroke="#7a5a68"/><circle cx="16" cy="16" r="4" fill="#e0a14d"/><circle cx="16" cy="16" r="1" fill="#111"/></svg>' },
+      "instrumental": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 3l7 10h-4l6 8h-5l5 7H7l5-7H7l6-8H9z" fill="#2f7a4b"/><rect x="14" y="27" width="4" height="3" fill="#7a4a24"/><circle cx="16" cy="3" r="2" fill="#e9d9a8"/></svg>' }
     }
   };
   var THEME = "christmas";
@@ -208,20 +207,27 @@
     el.hidden = !text;
   }
 
+  var shownPalette = null;  // key of the palette currently applied ("" = default)
+
   function setPalette(s) {
     var table = THEMES[THEME] || {};
     var p = Object.prototype.hasOwnProperty.call(table, s.mood) ? table[s.mood] : null;
+    var label = "";
+    (s.moods || []).forEach(function (m) { if (m.name === s.mood) { label = m.label; } });
+    var key = p ? THEME + "/" + s.mood + "|" + label : "";
+    if (key === shownPalette) { return; }  // unchanged since the last render
+    shownPalette = key;
     var body = document.body, ico = $("ico"), sub = $("sub");
     if (p) { body.setAttribute("data-theme", THEME); body.setAttribute("data-palette", s.mood); }
     else { body.removeAttribute("data-theme"); body.removeAttribute("data-palette"); }
     // The icons are fixed strings from the table above, never server data.
     ico.innerHTML = p ? p.icon : "";
     ico.hidden = !p;
-    var label = "";
-    (s.moods || []).forEach(function (m) { if (m.name === s.mood) { label = m.label; } });
     sub.textContent = p ? label : "";
     sub.hidden = !(p && label);
-    document.querySelector('meta[name="theme-color"]').setAttribute("content", p ? p.bg : DEFAULT_BG);
+    // Custom properties resolve at once (only the painted colours transition).
+    var bg = getComputedStyle(body).getPropertyValue("--bg").trim();
+    document.querySelector('meta[name="theme-color"]').setAttribute("content", bg);
   }
 
   function render(s) {

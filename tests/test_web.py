@@ -415,8 +415,9 @@ def _index_css():
 
 def test_index_page_has_a_palette_for_every_mood():
     html, css = _index_css()
+    themes = html.split("var THEMES = {")[1].split("var THEME =")[0]
     for mood in ("classic-swing", "modern", "soul-motown", "instrumental"):
-        assert f'"{mood}":' in html  # JS palette table key
+        assert f'"{mood}": {{ icon:' in themes  # key inside the THEMES table
         assert f'[data-palette="{mood}"]' in css  # CSS override block
 
 
@@ -448,4 +449,9 @@ def test_index_page_css_has_no_hardcoded_colours_outside_variables():
 def test_index_page_keeps_theme_color_meta():
     html, _ = _index_css()
     assert '<meta name="theme-color" content="#1a0f0a">' in html
-    assert "prefers-reduced-motion" in html
+
+
+def test_index_page_disables_transitions_for_reduced_motion():
+    _, css = _index_css()
+    block = css.split("@media (prefers-reduced-motion: reduce)")[1]
+    assert "transition: none" in block
