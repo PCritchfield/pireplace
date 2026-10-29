@@ -426,6 +426,9 @@ hotspot_password); fix `/etc/pireplace/config.toml` (or re-run the deploy) and r
   `-e pireplace_hdmi_card=vc4hdmi1`. `aplay -l` lists the cards.
 - **`Cannot load libcuda.so.1` in the mpv log:** harmless. mpv probes hardware decoders
   and CUDA does not exist on a Pi.
+- **The Pi runs hot or the fire video uses a lot of CPU:** the video unit must decode with
+  `--hwdec=v4l2m2m-copy` (the Pi 4 hardware H.264 decoder). `--hwdec=auto-safe` falls back
+  to software decoding there. The mpv log should say "Using hardware decoding (v4l2m2m-copy)".
 - **Deploy ends with "REBOOT REQUIRED":** the boot settings that keep console text off
   the TV changed. Run `sudo reboot` on the Pi.
 
