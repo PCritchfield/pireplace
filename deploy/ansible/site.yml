@@ -71,6 +71,12 @@
     pireplace_system_units:
       - pireplace-control.service
       - pireplace-wifi.service
+    # Safety net for the NetworkManager profiles (oneshots: installed and enabled, never
+    # restarted by the system-units handler).
+    pireplace_netbackup_units:
+      - pireplace-netrestore.service
+      - pireplace-netbackup.service
+      - pireplace-netbackup.path
     # Jellyfin music sync. Optional inventory vars: pireplace_jellyfin_api_key (turns it
     # on), pireplace_jellyfin_url, pireplace_jellyfin_user_id, pireplace_jellyfin_playlists
     # and pireplace_tailscale_authkey. Play vars outrank inventory vars, so the defaults
@@ -487,6 +493,16 @@
         - Reload systemd
         - Restart pireplace system services
 
+    - name: Install the NetworkManager profile backup and restore units
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../systemd/{{ item }}"
+        dest: /etc/systemd/system/{{ item }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pireplace_netbackup_units }}"
+      notify: Reload systemd
+
     - name: Install the Jellyfin sync units (service and timer)
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../systemd/{{ item }}"
@@ -643,6 +659,41 @@
         - NetworkManager.service
         - avahi-daemon.service
 
+    # Profiles must live as NetworkManager keyfiles. NM once wrote netplan YAML in place
+    # (/etc/netplan/90-NM-*.yaml) and left the files empty, which cost the Pi all networking.
+    # -e no keeps ':' in values unescaped; the UUID has none, so split at the first ':'.
+    - name: List the NetworkManager profiles and where they are stored
+      ansible.builtin.command:
+        argv: [nmcli, -g, "UUID,FILENAME", -e, "no", connection, show]
+      register: pireplace_nm_profiles
+      changed_when: false
+      check_mode: false
+
+    - name: Move any profile stored as netplan YAML into a keyfile (profiles under /run are left alone)
+      ansible.builtin.command:
+        argv: [nmcli, connection, migrate, --plugin, keyfile, "{{ item.partition(':')[0] }}"]
+      loop: "{{ pireplace_nm_profiles.stdout_lines }}"
+      loop_control:
+        label: "{{ item.partition(':')[0] }}"
+      when: item.partition(':')[2].startswith('/etc/netplan/')
+      changed_when: true
+
+    - name: Enable the NetworkManager profile backup, restore and watcher
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+      loop: "{{ pireplace_netbackup_units }}"
+
+    - name: Start the profile watcher
+      ansible.builtin.systemd_service:
+        name: pireplace-netbackup.path
+        state: started
+
+    - name: Back up the NetworkManager profiles once now
+      ansible.builtin.command:
+        argv: [systemctl, start, pireplace-netbackup.service]
+      changed_when: false
+
     - name: Enable and start the control page and Wi-Fi watcher
       ansible.builtin.systemd_service:
         name: "{{ item }}"
@@ -656,6 +707,35 @@
         enabled: true
         state: started
       when: pireplace_jf_enabled
+
+    # --- persistent journal ----------------------------------------------------
+
+    # Raspberry Pi OS ships 40-rpi-volatile-storage.conf (Storage=volatile); 90- sorts after it.
+    - name: Create the journald drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Keep the journal across reboots, capped for the SD card
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../journald/90-pireplace-persistent.conf"
+        dest: /etc/systemd/journald.conf.d/90-pireplace-persistent.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart journald
+
+    - name: Make sure the persistent journal directory exists
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
+        owner: root
+        group: systemd-journal
+        mode: "2755"
+      notify: Restart journald
 
     # --- quiet TV --------------------------------------------------------------
 
@@ -698,13 +778,26 @@
 
     # Imager's first-boot settings (user, Wi-Fi via netplan, hostname) are already
     # applied and persist without cloud-init. To undo: delete this file.
-    - name: Ensure /etc/cloud exists
+    - name: Ensure /etc/cloud and /etc/cloud/cloud.cfg.d exist
       ansible.builtin.file:
-        path: /etc/cloud
+        path: "{{ item }}"
         state: directory
         owner: root
         group: root
         mode: "0755"
+      loop:
+        - /etc/cloud
+        - /etc/cloud/cloud.cfg.d
+
+    # Never let cloud-init (Raspberry Pi Imager's /boot/firmware/network-config) render
+    # netplan network config again.
+    - name: Install the cloud-init drop-in that disables network config
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../cloud-init/99-pireplace-no-network.cfg"
+        dest: /etc/cloud/cloud.cfg.d/99-pireplace-no-network.cfg
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Disable cloud-init so its per-boot stages stay off the TV
       ansible.builtin.file:
@@ -749,6 +842,17 @@
     - name: Reload systemd
       ansible.builtin.systemd_service:
         daemon_reload: true
+
+    - name: Restart journald
+      ansible.builtin.systemd_service:
+        name: systemd-journald.service
+        state: restarted
+
+    - name: Move the volatile journal to disk
+      ansible.builtin.command:
+        argv: [journalctl, --flush]
+      listen: Restart journald
+      changed_when: true
 
     - name: Apply tmpfiles
       ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/pireplace.conf

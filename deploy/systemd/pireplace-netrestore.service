@@ -1,0 +1,43 @@
+[Unit]
+Description=pireplace: restore empty or lost NetworkManager profiles from the backup
+# Runs before NetworkManager reads its profiles on every boot. NetworkManager only
+# orders after it (never Requires it), so a failure here cannot stop networking.
+DefaultDependencies=no
+After=local-fs.target
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=/opt/pireplace
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m pireplace netbackup-restore
+# Root rewrites its own files; nothing else is writable.
+ReadWritePaths=/etc/NetworkManager/system-connections /var/lib/pireplace-netbackup
+StateDirectory=pireplace-netbackup
+StateDirectoryMode=0700
+
+# Hardening. Root needs no capabilities for its own files; no network at all.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=NetworkManager.service

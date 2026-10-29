@@ -12,6 +12,8 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 UNITS = ROOT / "deploy" / "systemd"
 SYSTEM_UNITS = ["pireplace-control.service", "pireplace-wifi.service"]
+# Root oneshots: the hardening applies, but they never restart (no Restart=always).
+NETBACKUP_SERVICES = ["pireplace-netrestore.service", "pireplace-netbackup.service"]
 USER_UNITS = ["pireplace-video.service", "pireplace-music.service"]
 
 
@@ -58,6 +60,73 @@ HARDENING = {
 def test_system_units_are_hardened(name):
     service = unit(name)["Service"]
     assert {k: service.get(k, [None])[-1] for k in HARDENING} == HARDENING
+
+
+@pytest.mark.parametrize("name", NETBACKUP_SERVICES)
+def test_netbackup_oneshots_are_hardened_and_offline(name):
+    service = unit(name)["Service"]
+    assert {k: service.get(k, [None])[-1] for k in HARDENING} == HARDENING
+    assert service["Type"] == ["oneshot"]
+    assert service["ProtectSystem"] == ["strict"]
+    assert service["PrivateNetwork"] == ["yes"]
+    assert service["CapabilityBoundingSet"] == [""]
+    assert set(service["ReadWritePaths"][0].split()) == {
+        "/etc/NetworkManager/system-connections", "/var/lib/pireplace-netbackup"}
+    assert service["StateDirectoryMode"] == ["0700"]
+    assert "Restart" not in service  # a oneshot must not loop
+
+
+def test_netrestore_runs_before_networkmanager_which_never_requires_it():
+    parsed = unit("pireplace-netrestore.service")
+    assert parsed["Unit"]["Before"] == ["NetworkManager.service"]
+    assert parsed["Unit"]["DefaultDependencies"] == ["no"]
+    assert parsed["Unit"]["After"] == ["local-fs.target"]
+    assert parsed["Install"]["WantedBy"] == ["NetworkManager.service"]
+    for key in ("Requires", "BindsTo", "Requisite"):
+        assert key not in parsed["Unit"]
+    for name in NETBACKUP_SERVICES:  # nothing in the units makes NM depend on a backup unit
+        assert "RequiredBy" not in unit(name).get("Install", {})
+
+
+def test_netbackup_runs_after_networkmanager_on_changes_and_once_per_boot():
+    service = unit("pireplace-netbackup.service")
+    assert service["Unit"]["After"] == ["NetworkManager.service"]
+    assert service["Install"]["WantedBy"] == ["multi-user.target"]
+    path = unit("pireplace-netbackup.path")
+    assert path["Path"]["PathChanged"] == ["/etc/NetworkManager/system-connections"]
+    assert path["Path"]["Unit"] == ["pireplace-netbackup.service"]
+    assert path["Install"]["WantedBy"] == ["multi-user.target"]
+
+
+def test_cloud_init_dropin_disables_network_config():
+    text = (ROOT / "deploy" / "cloud-init" / "99-pireplace-no-network.cfg").read_text()
+    assert "network: {config: disabled}" in text.splitlines()
+
+
+def test_journald_dropin_is_persistent_capped_and_sorts_after_the_pi_default():
+    path = ROOT / "deploy" / "journald" / "90-pireplace-persistent.conf"
+    assert path.name > "40-rpi-volatile-storage.conf"
+    settings = dict(
+        line.split("=", 1) for line in path.read_text().splitlines() if "=" in line and not line.startswith("#")
+    )
+    assert settings["Storage"] == "persistent"
+    assert settings["SystemMaxUse"] == "64M"
+    assert settings["SystemMaxFileSize"] == "8M"
+    assert settings["SystemKeepFree"] == "1G"
+    assert settings["MaxRetentionSec"] == "1month"
+
+
+def test_playbook_installs_the_safety_net_files():
+    for name in ("pireplace-netrestore.service", "pireplace-netbackup.service", "pireplace-netbackup.path"):
+        assert (UNITS / name).is_file() and name in SITE
+    for src, dest in (
+        ("cloud-init/99-pireplace-no-network.cfg", "/etc/cloud/cloud.cfg.d/99-pireplace-no-network.cfg"),
+        ("journald/90-pireplace-persistent.conf", "/etc/systemd/journald.conf.d/90-pireplace-persistent.conf"),
+    ):
+        assert (ROOT / "deploy" / src).is_file() and src in SITE and dest in SITE
+    assert "nmcli" in SITE and "migrate" in SITE and "/etc/netplan/" in SITE
+    play = yaml.safe_load(SITE)[1]
+    assert "pireplace-netbackup" not in " ".join(play["vars"]["pireplace_system_units"])
 
 
 @pytest.mark.parametrize("name", SYSTEM_UNITS + USER_UNITS)

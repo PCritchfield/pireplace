@@ -1,0 +1,9 @@
+[Unit]
+Description=pireplace: watch the NetworkManager profiles for changes
+
+[Path]
+PathChanged=/etc/NetworkManager/system-connections
+Unit=pireplace-netbackup.service
+
+[Install]
+WantedBy=multi-user.target
