@@ -208,7 +208,10 @@ than 15 minutes is given up and retried later. After a run that added or removed
 the sync asks the control page to rescan, so new music shows up without a button press.
 A rescan reshuffles the current mood, so while music is playing (or if the control page
 does not answer) it waits: it leaves `/srv/pireplace/music/.pireplace-rescan-pending`
-and a later run rescans once the music is paused. If the server is unreachable the run
+and a later run rescans once the music is paused. Files are deleted the same way (a
+track taken off a playlist, a FLAC replaced by its Opus copy): only when music is known
+to be paused, since the player may still be holding them; until then they stay on the
+card and a later run deletes them and rescans. If the server is unreachable the run
 fails cleanly and the music keeps playing; a failed run is retried every 10 minutes, up
 to 4 times, before it waits for the next night (a config error is not retried).
 

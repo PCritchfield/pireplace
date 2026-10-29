@@ -337,15 +337,19 @@ def sync_mood(
     free_bytes: Callable[[Path], int] = default_free_bytes,
     profile: str = ORIGINAL,
     bitrate_kbps: int = 160,
+    allow_deletes: bool = True,
 ) -> MoodResult:
     """Sync one mood. Any error, filesystem ones included, ends up in ``.error``.
 
     `profile` is "original" (fetch the file as stored) or "opus-<kbps>" (fetch a
-    transcode at `bitrate_kbps`, never the original).
+    transcode at `bitrate_kbps`, never the original). Without `allow_deletes` (music
+    may be playing them) nothing is deleted: every file the run would delete is
+    recorded as stale instead, and owed stale deletes wait too.
     """
     result = MoodResult(mood=mood)
     try:
-        _sync_mood(client, mood, playlist_id, Path(mood_dir), free_bytes, result, profile, bitrate_kbps)
+        _sync_mood(client, mood, playlist_id, Path(mood_dir), free_bytes, result, profile, bitrate_kbps,
+                   allow_deletes)
     except OSError as e:
         result.error = f"filesystem error: {e}"
     return result
@@ -353,7 +357,7 @@ def sync_mood(
 
 def _sync_mood(
     client, mood: str, playlist_id: str, mood_dir: Path, free_bytes, result: MoodResult,
-    profile: str, bitrate_kbps: int,
+    profile: str, bitrate_kbps: int, allow_deletes: bool = True,
 ) -> None:
     transcode = profile != ORIGINAL
     ext = "ogg" if transcode else None
@@ -362,7 +366,7 @@ def _sync_mood(
     _warn_if_ownership_reset(mood, mood_dir, problem)
 
     # Old files an earlier run replaced but could not delete: retried first.
-    if stale:
+    if stale and allow_deletes:
         left = _delete_stale(mood, mood_dir, stale, manifest, result)
         if left != stale:
             stale = left
@@ -493,7 +497,14 @@ def _sync_mood(
             return
 
     # Delete only manifest-recorded bare filenames, and never one still in use.
+    # While deletes are not allowed, the file is only dropped from the items and owed.
     for item_id, name in to_delete.items():
+        if name not in keep and not allow_deletes:
+            stale.add(name)
+            del manifest[item_id]
+            profiles.pop(item_id, None)
+            changed = True
+            continue
         if name not in keep:
             path = mood_dir / name
             if path.parent != mood_dir:  # defence in depth; _is_safe_name already ensures this
@@ -507,7 +518,7 @@ def _sync_mood(
         del manifest[item_id]
         profiles.pop(item_id, None)
         result.removed += 1
-    if replaced:
+    if replaced and allow_deletes:
         stale = (stale - replaced) | _delete_stale(mood, mood_dir, replaced, manifest, result)
 
     if changed or result.added or result.removed or superseded:
@@ -516,6 +527,9 @@ def _sync_mood(
         except OSError:
             result.error = "cannot write manifest"
             return
+    if stale and not allow_deletes:
+        log.info("mood=%s: %d deletes deferred (music may be playing); a later run does them",
+                 mood, len(stale))
     problems = []
     if result.failed:
         problems.append(f"{result.failed} downloads failed (first: {reasons[0]})")
@@ -564,16 +578,15 @@ def music_playing(port: int, timeout: float = 10.0) -> bool | None:
         return None
 
 
-def _rescan_when_quiet(music_dir: Path, changed: bool, rescan, playing) -> None:
+def _rescan_when_quiet(music_dir: Path, changed: bool, rescan, state: bool | None) -> None:
     """Rescan if something changed or a rescan is pending, but never under playing music.
 
     A rescan reshuffles the current mood, so while music plays (or when that cannot be
-    told) it is deferred: a marker file asks a later run to do it.
+    told: `state` None) it is deferred: a marker file asks a later run to do it.
     """
     marker = music_dir / RESCAN_PENDING
     if not (changed or marker.exists()):
         return
-    state = playing()
     if state is False and rescan():
         marker.unlink(missing_ok=True)
         return
@@ -597,15 +610,20 @@ def run_sync(
 ) -> int:
     """Sync every configured mood, then rescan if due (see _rescan_when_quiet).
 
+    Whether music plays is asked once, up front. Files are deleted only when it is
+    known not to be (mpv may hold a playlist of them); otherwise the deletes are owed
+    to a later run, which then deletes them and rescans.
     0 if every mood synced, 1 if any mood errored; rescan problems are only warnings.
     """
     changed = False
     failed = False
+    state = playing()
+    allow_deletes = state is False
     profile = audio_profile(jf)
     for mood, playlist_id in jf.playlists.items():
         result = sync_mood(
             client, mood, playlist_id, config.music_dir / mood, free_bytes=default_free_bytes,
-            profile=profile, bitrate_kbps=jf.audio_bitrate_kbps,
+            profile=profile, bitrate_kbps=jf.audio_bitrate_kbps, allow_deletes=allow_deletes,
         )
         line = (
             f"mood={mood} added={result.added} removed={result.removed} failed={result.failed}"
@@ -616,6 +634,6 @@ def run_sync(
             failed = True
         log.info("%s", line)
         changed = changed or bool(result.added or result.removed)
-    _rescan_when_quiet(config.music_dir, changed, rescan, playing)
+    _rescan_when_quiet(config.music_dir, changed, rescan, state)
     return 1 if failed else 0
 

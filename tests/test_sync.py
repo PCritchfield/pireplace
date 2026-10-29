@@ -502,11 +502,11 @@ def test_pending_marker_kept_while_still_playing(tmp_path):
     assert c.rescans == 0 and _marker(tmp_path).exists()
 
 
-def test_nothing_changed_and_no_marker_asks_nothing(tmp_path):
+def test_nothing_changed_and_no_marker_asks_once_and_does_not_rescan(tmp_path):
     cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
     c = Calls()
     assert run_sync(cfg, jf, FakeClient([]), c.rescan, c.playing) == 0
-    assert (c.asked, c.rescans) == (0, 0) and not _marker(tmp_path).exists()
+    assert (c.asked, c.rescans) == (1, 0) and not _marker(tmp_path).exists()
 
 
 def test_failed_rescan_leaves_a_marker_for_the_next_run(tmp_path):
@@ -1280,3 +1280,125 @@ def test_ownership_reset_leaves_a_flac_of_the_wrong_size(fake, tmp_path):
     assert res.error is None
     assert files(tmp_path) == sorted([track_filename(ta), track_filename(ta, "ogg")])
     assert full_manifest(tmp_path)["items"] == {A: track_filename(ta, "ogg")}
+
+
+# --- final review: no deletes under playing music; bounded, single-stream Ogg reads ---
+
+
+def _music_migrating(fake, tmp_path):
+    """A FLAC mood under music/ about to migrate to Opus, run through run_sync."""
+    (tmp_path / "music").mkdir(exist_ok=True)
+    ta = jtrack(A, "One", 10)
+    mood = flac_mood(tmp_path / "music", [ta])
+    fake.playlists[PL] = [jitem(A, "One", 10)]
+    fake.transcodes = {A: ogg_body(10)}
+    return ta, mood
+
+
+def _opus_jf(tmp_path):
+    return _jf(tmp_path, "modern", audio_format="opus")
+
+
+@pytest.mark.parametrize("state", [True, None])
+def test_migration_while_playing_or_unknown_defers_the_delete(fake, tmp_path, flac_unlinks, state):
+    ta, mood = _music_migrating(fake, tmp_path)
+    c = Calls(playing=state)
+    assert run_sync(_config(tmp_path), _opus_jf(tmp_path), jclient(fake), c.rescan, c.playing) == 0
+    assert (mood / track_filename(ta, "ogg")).exists() and (mood / track_filename(ta)).exists()
+    m = json.loads((mood / MANIFEST).read_text())
+    assert m["items"] == {A: track_filename(ta, "ogg")}
+    assert m["stale"] == [track_filename(ta)]
+    assert flac_unlinks == []
+    assert c.asked == 1 and c.rescans == 0 and _marker(tmp_path).exists()
+
+
+def test_deferred_delete_runs_once_music_stops_and_rescans(fake, tmp_path, flac_unlinks):
+    ta, mood = _music_migrating(fake, tmp_path)
+    run_sync(_config(tmp_path), _opus_jf(tmp_path), jclient(fake), Calls().rescan, Calls(playing=True).playing)
+    _marker(tmp_path).unlink()  # the deleted file alone must make the run rescan
+    c = Calls(playing=False)
+    assert run_sync(_config(tmp_path), _opus_jf(tmp_path), jclient(fake), c.rescan, c.playing) == 0
+    assert not (mood / track_filename(ta)).exists()
+    assert (mood / track_filename(ta, "ogg")).exists()
+    assert json.loads((mood / MANIFEST).read_text())["stale"] == []
+    assert flac_unlinks == [("unlink", track_filename(ta))]
+    assert c.asked == 1 and c.rescans == 1 and not _marker(tmp_path).exists()
+
+
+def test_owed_stale_deletes_wait_while_playing(fake, tmp_path, flac_unlinks):
+    ta, mood = _music_migrating(fake, tmp_path)
+    run_sync(_config(tmp_path), _opus_jf(tmp_path), jclient(fake), Calls().rescan, Calls(playing=True).playing)
+    c = Calls(playing=True)
+    assert run_sync(_config(tmp_path), _opus_jf(tmp_path), jclient(fake), c.rescan, c.playing) == 0
+    assert (mood / track_filename(ta)).exists()
+    assert json.loads((mood / MANIFEST).read_text())["stale"] == [track_filename(ta)]
+    assert flac_unlinks == []
+
+
+def test_playlist_removal_while_playing_is_deferred(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    a, b = T("a"), T("b")
+    run_sync(cfg, jf, FakeClient([a, b]), Calls().rescan, Calls().playing)
+    mood = tmp_path / "music" / "modern"
+    c = Calls(playing=True)
+    assert run_sync(cfg, jf, FakeClient([a]), c.rescan, c.playing) == 0
+    assert (mood / track_filename(b)).exists()
+    m = json.loads((mood / MANIFEST).read_text())
+    assert m["items"] == {a.id: track_filename(a)}
+    assert m["stale"] == [track_filename(b)]
+    c = Calls(playing=False)
+    assert run_sync(cfg, jf, FakeClient([a]), c.rescan, c.playing) == 0
+    assert not (mood / track_filename(b)).exists()
+    assert json.loads((mood / MANIFEST).read_text())["stale"] == []
+    assert c.rescans == 1
+
+
+def test_deferred_removal_readded_to_the_playlist_is_kept(tmp_path):
+    cfg, jf = _config(tmp_path), _jf(tmp_path, "modern")
+    a, b = T("a"), T("b")
+    run_sync(cfg, jf, FakeClient([a, b]), Calls().rescan, Calls().playing)
+    run_sync(cfg, jf, FakeClient([a]), Calls().rescan, Calls(playing=True).playing)
+    mood = tmp_path / "music" / "modern"
+    run_sync(cfg, jf, FakeClient([a, b]), Calls().rescan, Calls(playing=True).playing)
+    assert run_sync(cfg, jf, FakeClient([a, b]), Calls().rescan, Calls(playing=False).playing) == 0
+    assert (mood / track_filename(b)).exists()
+    m = json.loads((mood / MANIFEST).read_text())
+    assert set(m["items"]) == {a.id, b.id} and m["stale"] == []
+
+
+def test_ogg_duration_s_of_a_chained_stream_is_none(tmp_path):
+    body = ogg_body(10)
+    last = bytearray(body[-LAST_PAGE_LEN:])
+    last[14:18] = b"\2\0\0\0"  # another logical stream's serial
+    f = tmp_path / "x.ogg"
+    f.write_bytes(body[:-LAST_PAGE_LEN] + bytes(last))
+    assert ogg_duration_s(f) is None
+
+
+def test_ogg_duration_s_reads_a_bounded_tail(tmp_path, monkeypatch):
+    f = tmp_path / "x.ogg"
+    f.write_bytes(ogg_body(60))  # ~1.2 MB, far more than the tail
+    sizes = []
+    real = sync_mod._open_nofollow
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self.inner.__exit__(*a)
+
+        def read(self, n=-1):
+            sizes.append(n)
+            return self.inner.read(n)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    monkeypatch.setattr(sync_mod, "_open_nofollow", lambda p: Spy(real(p)))
+    assert ogg_duration_s(f) == pytest.approx(60)
+    assert all(0 <= n <= sync_mod.OGG_TAIL for n in sizes)
