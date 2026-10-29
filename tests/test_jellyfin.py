@@ -106,13 +106,22 @@ def test_truncated_download_removes_dest(fake, tmp_path):
     assert not dest.exists()
 
 
-def test_download_http_error_removes_preexisting_dest(fake, tmp_path):
+def test_download_http_error_leaves_preexisting_dest(fake, tmp_path):
     dest = tmp_path / ".part"
     dest.write_bytes(b"stale")
     with pytest.raises(JellyfinError) as e:
-        client(fake).download("z" * 32, dest)  # 404
+        client(fake).download("f" * 32, dest)  # 404
     assert "404" in str(e.value) and fake.key not in str(e.value)
-    assert not dest.exists()
+    assert dest.read_bytes() == b"stale"
+
+
+def test_download_existing_dest_is_not_deleted(fake, tmp_path):
+    fake.files["a" * 32] = b"x" * 10
+    dest = tmp_path / ".part"
+    dest.write_bytes(b"mine")
+    with pytest.raises(JellyfinError):
+        client(fake).download("a" * 32, dest)
+    assert dest.read_bytes() == b"mine"
 
 
 def test_unreachable_server_is_jellyfin_error(tmp_path):
@@ -286,7 +295,7 @@ def test_transcoded_download_http_error_has_no_secrets(fake, tmp_path):
         client(fake).download_transcoded("a" * 32, dest, 160)
     msg = str(e.value)
     assert "403" in msg and fake.key not in msg and "audioBitRate" not in msg
-    assert e.value.__cause__ is None and not dest.exists()
+    assert e.value.__cause__ is None and dest.read_bytes() == b"stale"
 
 
 def test_transcoded_download_never_follows_redirect(fake, tmp_path):
@@ -327,3 +336,47 @@ def test_transcoded_download_is_fsynced_and_never_follows_symlink(fake, tmp_path
     with pytest.raises(JellyfinError):
         client(fake).download_transcoded("a" * 32, dest, 160)
     assert victim.read_text() == "keep"
+
+
+def test_transcoded_download_over_max_bytes_aborts(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 5000
+    dest = tmp_path / ".part"
+    with pytest.raises(JellyfinError) as e:
+        client(fake).download_transcoded("a" * 32, dest, 160, max_bytes=1000)
+    assert "audioBitRate" not in str(e.value)
+    assert not dest.exists()
+
+
+def test_transcoded_content_type_reject_leaves_preexisting_dest(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 10
+    fake.transcode_type["a" * 32] = "text/html"
+    dest = tmp_path / ".part"
+    dest.write_bytes(b"mine")
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert dest.read_bytes() == b"mine"
+
+
+def test_transcoded_existing_dest_is_not_deleted(fake, tmp_path):
+    fake.transcodes["a" * 32] = b"OggS" + b"x" * 10
+    dest = tmp_path / ".part"
+    dest.write_bytes(b"mine")
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, dest, 160)
+    assert dest.read_bytes() == b"mine"
+
+
+@pytest.mark.parametrize("bad", ["..", "a/b", "", "z" * 32, "a" * 31, "a" * 33])
+def test_downloads_reject_bad_item_ids_without_a_request(fake, tmp_path, bad):
+    with pytest.raises(JellyfinError):
+        client(fake).download(bad, tmp_path / "d1")
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded(bad, tmp_path / "d2", 160)
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("bad", [True, 31, 513, 0, -1, 160.0, "160", None])
+def test_transcoded_download_rejects_bad_bitrate_without_a_request(fake, tmp_path, bad):
+    with pytest.raises(JellyfinError):
+        client(fake).download_transcoded("a" * 32, tmp_path / ".part", bad)
+    assert fake.requests == []

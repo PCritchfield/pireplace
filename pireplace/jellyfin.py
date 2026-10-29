@@ -25,6 +25,8 @@ CHUNK = 1024 * 1024
 _ITEM_ID = re.compile(r"[0-9a-fA-F]{32}")  # Jellyfin item Ids; anything else is skipped
 # A relay that trickles must not hold a run for hours: give up on a file after this.
 DOWNLOAD_DEADLINE = 15 * 60.0
+# Default ceiling on one transcode; the sync passes a tighter, duration-based cap.
+MAX_TRANSCODE_BYTES = 64 * 1024**2
 
 
 class JellyfinError(Exception):
@@ -88,6 +90,11 @@ def _track(raw: dict) -> Track | None:
         size=size,
         duration_s=duration,
     )
+
+
+def _check_item_id(item_id) -> None:
+    if not isinstance(item_id, str) or not _ITEM_ID.fullmatch(item_id):
+        raise JellyfinError("invalid item Id") from None
 
 
 class JellyfinClient:
@@ -162,14 +169,17 @@ class JellyfinClient:
         The data is fsynced before returning, so a rename into place after a power cut
         never leaves an empty or partial track. On any error `dest` is removed.
         """
+        _check_item_id(item_id)
         dest = Path(dest)
         path = f"/Items/{urllib.parse.quote(item_id, safe='')}/Download"
         written = 0
+        created = False
         deadline = time.monotonic() + self._download_deadline
         resp, err = self._request(path)
         if resp is not None:
             try:
                 with closing(resp), open(dest, "xb") as out:
+                    created = True
                     # read1: return what has arrived, so the deadline is checked as data
                     # trickles in rather than after a whole chunk.
                     while chunk := resp.read1(CHUNK):
@@ -188,27 +198,35 @@ class JellyfinClient:
             except (OSError, http.client.HTTPException, ValueError):
                 err = f"download failed for {path}"
         if err is not None:
-            dest.unlink(missing_ok=True)
+            if created:  # never delete a file this call did not create
+                dest.unlink(missing_ok=True)
             raise JellyfinError(err) from None
         return written
 
-    def download_transcoded(self, item_id: str, dest: Path, bitrate_kbps: int) -> int:
+    def download_transcoded(
+        self, item_id: str, dest: Path, bitrate_kbps: int, max_bytes: int = MAX_TRANSCODE_BYTES
+    ) -> int:
         """Write an Opus-in-Ogg transcode of the item to `dest`, which must not exist.
 
         Jellyfin streams transcodes, so Content-Length is usually absent: the body is
         accepted only if the Content-Type is ``audio/*`` and it starts with ``OggS``.
-        Fsynced before returning. On any error `dest` is removed.
+        Fsynced before returning. Aborts once more than `max_bytes` arrive. On any error
+        `dest` is removed, unless this call did not create it.
         """
+        _check_item_id(item_id)
+        if isinstance(bitrate_kbps, bool) or not isinstance(bitrate_kbps, int) or not 32 <= bitrate_kbps <= 512:
+            raise JellyfinError("invalid bitrate") from None
         dest = Path(dest)
         path = f"/Audio/{urllib.parse.quote(item_id, safe='')}/stream.ogg"
         query = urllib.parse.urlencode({
             "audioCodec": "opus",
-            "audioBitRate": int(bitrate_kbps) * 1000,
+            "audioBitRate": bitrate_kbps * 1000,
             "audioChannels": 2,
             "static": "false",
             "userId": self._user_id,
         })
         written = 0
+        created = False
         deadline = time.monotonic() + self._download_deadline
         resp, err = self._request(path, query)
         if resp is not None:
@@ -220,6 +238,7 @@ class JellyfinClient:
                     else:
                         head = b""
                         with open(dest, "xb") as out:
+                            created = True
                             while chunk := resp.read1(CHUNK):
                                 if len(head) < 4:
                                     head = (head + chunk)[:4]
@@ -227,6 +246,9 @@ class JellyfinClient:
                                         break
                                 out.write(chunk)
                                 written += len(chunk)
+                                if written > max_bytes:
+                                    err = f"response from {path} is larger than {max_bytes} bytes"
+                                    break
                                 if time.monotonic() > deadline:
                                     err = f"download took longer than {self._download_deadline:g} s for {path}"
                                     break
@@ -242,6 +264,7 @@ class JellyfinClient:
             except (OSError, http.client.HTTPException, ValueError):
                 err = f"download failed for {path}"
         if err is not None:
-            dest.unlink(missing_ok=True)
+            if created:  # never delete a file this call did not create
+                dest.unlink(missing_ok=True)
             raise JellyfinError(err) from None
         return written
