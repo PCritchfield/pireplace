@@ -17,8 +17,7 @@ NoNewPrivileges=yes
 # the controller then only applies volume/mute (and reloads after a rescan).
 # --volume=40 matches the default log_volume, so after a restart or boot the fire sound
 # starts at that level instead of mpv's 100% until the controller applies the saved volume.
-# Pi 4 hardware H.264 decoder; auto-safe falls back to software decoding there (~1.5 cores, overheats).
-ExecStart=/usr/bin/mpv --volume=40 --vo=gpu --gpu-context=drm --hwdec=v4l2m2m-copy --fullscreen --idle=yes --loop-playlist=inf --no-osc --osd-level=0 --no-input-default-bindings --input-ipc-server=/run/pireplace/video.sock --really-quiet /srv/pireplace/videos
+ExecStart=/usr/bin/mpv --volume=40 --vo=gpu --gpu-context=drm --hwdec=auto-safe --fullscreen --idle=yes --loop-playlist=inf --no-osc --osd-level=0 --no-input-default-bindings --input-ipc-server=/run/pireplace/video.sock --really-quiet /srv/pireplace/videos
 Restart=always
 RestartSec=2
 
