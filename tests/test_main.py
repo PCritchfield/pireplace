@@ -131,14 +131,14 @@ PL_ID = "a" * 32
 USER_ID = "b" * 32
 
 
-def _write_cfg(tmp_path, url="http://127.0.0.1:1", key="k" * 20, port=80, jellyfin=True):
+def _write_cfg(tmp_path, url="http://127.0.0.1:1", key="k" * 20, port=80, jellyfin=True, audio=""):
     key_file = tmp_path / "jf.key"
     if key is not None:
         key_file.write_text(key + "\n")
     text = f'[media]\nmusic_dir = "{tmp_path / "music"}"\n[web]\nport = {port}\n'
     if jellyfin:
         text += (
-            f'[jellyfin]\nurl = "{url}"\nuser_id = "{USER_ID}"\napi_key_file = "{key_file}"\n'
+            f'[jellyfin]\nurl = "{url}"\nuser_id = "{USER_ID}"\napi_key_file = "{key_file}"\n{audio}'
             f'[jellyfin.playlists]\nmodern = "{PL_ID}"\n'
         )
     cfg = tmp_path / "config.toml"
@@ -187,10 +187,23 @@ def test_sync_cli_end_to_end_with_fake_jellyfin(tmp_path, fake, plenty_of_space,
     port, seen = rescan_server  # answers GET /api/status with music not playing
     fake.playlists[PL_ID] = [_item("c" * 32, "One")]
     fake.files["c" * 32] = b"audio"
-    cfg = _write_cfg(tmp_path, url=fake.url, key=fake.key, port=port)
+    cfg = _write_cfg(tmp_path, url=fake.url, key=fake.key, port=port, audio='audio_format = "original"\n')
     assert main(["sync", "--config", str(cfg)]) == 0
     assert any((tmp_path / "music" / "modern").glob("*.flac"))
     assert [s[0] for s in seen] == ["/api/status", "/api/rescan"]
+
+
+def test_sync_cli_transcodes_by_default(tmp_path, fake, plenty_of_space, rescan_server):
+    port, _ = rescan_server
+    fake.playlists[PL_ID] = [_item("c" * 32, "One")]
+    fake.files["c" * 32] = b"audio"
+    fake.transcodes["c" * 32] = b"OggS opus"
+    cfg = _write_cfg(tmp_path, url=fake.url, key=fake.key, port=port, audio="audio_bitrate_kbps = 96\n")
+    assert main(["sync", "--config", str(cfg)]) == 0
+    assert [p.suffix for p in (tmp_path / "music" / "modern").iterdir() if not p.name.startswith(".")] == [".ogg"]
+    paths = [p for p, _ in fake.requests]
+    assert not any("/Download" in p for p in paths)
+    assert any(p.startswith(f"/Audio/{'c' * 32}/stream.ogg?") and "audioBitRate=96000" in p for p in paths)
 
 
 def test_api_key_never_logged(tmp_path, fake, plenty_of_space, caplog, capsys):
