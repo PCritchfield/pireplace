@@ -64,15 +64,16 @@ def test_stop_hotspot_command():
 class ProfileNm:
     """A runner that behaves like nmcli for the hotspot profile: tracks one profile."""
 
-    def __init__(self, exists=False, ssid="pireplace-setup", psk="12345678", read_fails=False, up_fails=0):
+    def __init__(self, exists=False, ssid="pireplace-setup", psk="12345678", read_fails=False, up_fails=0,
+                 up_removes=True):
         self.exists, self.ssid, self.psk = exists, ssid, psk
-        self.read_fails, self.up_fails = read_fails, up_fails
+        self.read_fails, self.up_fails, self.up_removes = read_fails, up_fails, up_removes
         self.calls = []
 
     def __call__(self, cmd):
         self.calls.append(cmd)
-        if cmd[:3] == ["nmcli", "-t", "-f"] and cmd[3] == "NAME,TYPE":
-            return "pireplace-hotspot:802-11-wireless\n" if self.exists else "Wired:802-3-ethernet\n"
+        if cmd[:3] == ["nmcli", "-t", "-f"] and cmd[3] in ("NAME", "NAME,TYPE"):
+            return "pireplace-hotspot\n" if self.exists else "Wired\n"
         if "-g" in cmd:
             if self.read_fails:
                 raise subprocess.CalledProcessError(1, cmd, stderr=f"boom {self.psk}")
@@ -81,7 +82,7 @@ class ProfileNm:
             self.exists = True
         if cmd[:3] == ["nmcli", "connection", "up"] and self.up_fails:
             self.up_fails -= 1
-            self.exists = False
+            self.exists = self.exists and not self.up_removes
             raise subprocess.CalledProcessError(10, cmd)
         return ""
 
@@ -98,7 +99,7 @@ def test_ensure_hotspot_profile_creates_it_when_missing():
     assert run.writes() == [[
         "nmcli", "connection", "add", "type", "wifi", "ifname", "wlan0", "con-name", "pireplace-hotspot",
         "autoconnect", "no", "ssid", "pireplace-setup", "802-11-wireless.mode", "ap",
-        "802-11-wireless.band", "bg", "ipv4.method", "shared", "ipv6.method", "ignore",
+        "ipv4.method", "shared", "ipv6.method", "ignore",
         "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn", "wifi-sec.pairwise", "ccmp",
         "wifi-sec.group", "ccmp", "wifi-sec.psk", "12345678"]]
 
@@ -107,7 +108,7 @@ def test_ensure_hotspot_profile_writes_nothing_when_it_matches():
     run = ProfileNm(exists=True)
     Nmcli(run).ensure_hotspot_profile("pireplace-setup", "12345678")
     assert run.writes() == []
-    assert ["nmcli", "-s", "-g", "802-11-wireless.ssid,802-11-wireless-security.psk",
+    assert ["nmcli", "-e", "no", "-s", "-g", "802-11-wireless.ssid,802-11-wireless-security.psk",
             "connection", "show", "pireplace-hotspot"] in run.calls
 
 
@@ -121,7 +122,7 @@ def test_ensure_hotspot_profile_modifies_once_when_it_differs_or_cannot_be_read(
 
 def test_ensure_hotspot_profile_errors_never_contain_the_password():
     def run(cmd):
-        if cmd[3] == "NAME,TYPE":
+        if cmd[3] == "NAME":
             return ""
         raise subprocess.CalledProcessError(4, cmd, stderr=f"bad {SECRET}")
     with pytest.raises(WifiError) as ei:
@@ -131,8 +132,8 @@ def test_ensure_hotspot_profile_errors_never_contain_the_password():
 
 def test_failed_modify_error_never_contains_the_password():
     def run(cmd):
-        if cmd[3] == "NAME,TYPE":
-            return "pireplace-hotspot:802-11-wireless\n"
+        if cmd[3] == "NAME":
+            return "pireplace-hotspot\n"
         if "-g" in cmd:
             return "x\nstale-psk-value\n"
         raise subprocess.CalledProcessError(4, cmd, stderr=f"bad {SECRET} stale-psk-value")
@@ -159,6 +160,51 @@ def test_start_hotspot_reensures_after_connection_up_fails():
     n.start_hotspot("pireplace-setup", "12345678")
     assert len(run.writes()) == 2  # created, lost, created again
     assert len(run.ups()) == 2
+
+
+def test_up_failure_with_the_profile_still_there_does_not_rewrite_it():
+    run = ProfileNm(exists=False, up_removes=False)
+    n = Nmcli(run)
+    n.start_hotspot("pireplace-setup", "12345678")  # creates the profile
+    run.up_fails = 1
+    with pytest.raises(WifiError):
+        n.start_hotspot("pireplace-setup", "12345678")
+    run.calls.clear()
+    n.start_hotspot("pireplace-setup", "12345678")
+    assert run.writes() == [] and not any("-g" in c for c in run.calls)
+    assert len(run.ups()) == 1
+
+
+def test_ensure_compares_a_psk_with_colon_and_backslash_without_writing():
+    psk = "pa:ss\\word1"
+    run = ProfileNm(exists=True, psk=psk)
+    Nmcli(run).ensure_hotspot_profile("pireplace-setup", psk)
+    assert run.writes() == []
+    assert ["nmcli", "-e", "no"] == [c for c in run.calls if "-g" in c][0][:3]
+
+
+def test_blank_stored_psk_does_not_mangle_later_error_messages():
+    n = Nmcli(ProfileNm(exists=True, psk=""))
+    n.ensure_hotspot_profile("pireplace-setup", "12345678")
+    assert "" not in n._secrets
+
+    def run(cmd):
+        raise subprocess.CalledProcessError(4, cmd, stderr="No suitable device")
+    n._run = run
+    with pytest.raises(WifiError) as ei:
+        n.connect("Home", "12345678")
+    assert str(ei.value).endswith("No suitable device")
+
+
+def test_hotspot_clients_warns_on_the_first_failure_only(caplog):
+    def run(cmd):
+        raise FileNotFoundError("iw")
+    n = Nmcli(run)
+    caplog.set_level(logging.DEBUG)
+    n.hotspot_clients()
+    n.hotspot_clients()
+    levels = [r.levelno for r in caplog.records if "hotspot clients" in r.getMessage()]
+    assert levels == [logging.WARNING, logging.DEBUG]
 
 
 IW_DUMP = (
@@ -728,6 +774,15 @@ def test_watch_keeps_the_hotspot_while_a_client_is_connected(tmp_path, caplog):
     assert caplog.text.count("hotspot kept: 1 client(s) connected") == 1
 
 
+def test_a_client_that_never_leaves_cannot_block_the_retry_forever(tmp_path):
+    nm, clock = WatchNm(clients=1), Clock()
+    stops = stamp(nm, clock, "stop_hotspot")
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=130)  # t = 0..1290
+    # hotspot at 300; due at 600 and 900 (skipped), 3rd expiry at 1200 retries anyway
+    assert stops == [1200]
+    assert "try_known" in nm.calls
+
+
 class TimedClock(Clock):
     """A Clock that runs scripted changes when time passes a given second."""
 
@@ -804,8 +859,8 @@ class SimNm:
             return "wlan0:wifi:connected:pireplace-hotspot\n" if self.hotspot else "wlan0:wifi:disconnected:\n"
         if cmd[:4] == ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE"]:
             return "pireplace-hotspot:802-11-wireless:wlan0\n" if self.hotspot else ""
-        if cmd[:4] == ["nmcli", "-t", "-f", "NAME,TYPE"]:
-            return "pireplace-hotspot:802-11-wireless\n" if self.profile else ""
+        if cmd[:4] == ["nmcli", "-t", "-f", "NAME"]:
+            return "pireplace-hotspot\n" if self.profile else ""
         if cmd[:3] == ["nmcli", "connection", "add"]:
             self.profile = True
         if cmd[:3] == ["nmcli", "connection", "up"]:

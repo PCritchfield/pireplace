@@ -39,6 +39,7 @@ CONNECTING_NAME = "wifi-connecting"
 MIN_PSK, MAX_PSK = 8, 63  # WPA2 passphrase length
 MAX_SSID_BYTES = 32
 MAX_RETRY_S = 1800  # ceiling for the retry back-off
+MAX_CLIENT_SKIPS = 2  # due retries skipped for an attached client before retrying anyway
 
 
 class WifiError(Exception):
@@ -84,6 +85,7 @@ class Nmcli:
         self._clock = clock
         self._secrets: set[str] = set()  # passwords seen so far; redacted from stderr
         self._hotspot_ensured = False  # the hotspot profile was checked/created by this process
+        self._clients_warned = False  # hotspot_clients failure already logged at WARNING
 
     def _call(self, cmd: list[str], secret: str = "") -> str:
         if secret:
@@ -120,27 +122,31 @@ class Nmcli:
     def hotspot_active(self) -> bool:
         return any(r[0] == HOTSPOT_CON for r in self._active())
 
+    def _hotspot_profile_exists(self) -> bool:
+        out = self._call(["nmcli", "-t", "-f", "NAME", "connection", "show"])
+        return any(split_terse(line)[0] == HOTSPOT_CON for line in out.splitlines())
+
     def ensure_hotspot_profile(self, ssid: str, password: str) -> None:
         """Make sure the hotspot profile exists with this SSID and PSK, with at most one write.
 
         NetworkManager rewrites profile files on every change, so we only write when needed.
         """
-        out = self._call(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
-        if not any(r[0] == HOTSPOT_CON for r in _rows(out, 2)):
+        if not self._hotspot_profile_exists():
             self._call(["nmcli", "connection", "add", "type", "wifi", "ifname", HOTSPOT_IFACE,
                         "con-name", HOTSPOT_CON, "autoconnect", "no", "ssid", ssid,
-                        "802-11-wireless.mode", "ap", "802-11-wireless.band", "bg",
+                        "802-11-wireless.mode", "ap",
                         "ipv4.method", "shared", "ipv6.method", "ignore",
                         "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn",
                         "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp",
                         "wifi-sec.psk", password], secret=password)
             return
         try:
-            stored = self._call(["nmcli", "-s", "-g", "802-11-wireless.ssid,802-11-wireless-security.psk",
+            stored = self._call(["nmcli", "-e", "no", "-s", "-g", "802-11-wireless.ssid,802-11-wireless-security.psk",
                                  "connection", "show", HOTSPOT_CON], secret=password).splitlines()
         except WifiError:
             stored = []
-        self._secrets.update(stored[1:2])  # the PSK read back is a secret too: redact it
+        if len(stored) > 1 and stored[1]:  # never an empty string: replace("") would mangle messages
+            self._secrets.add(stored[1])  # the PSK read back is a secret too: redact it
         if stored[:2] == [ssid, password]:
             return
         self._call(["nmcli", "connection", "modify", HOTSPOT_CON, "802-11-wireless.ssid", ssid,
@@ -153,7 +159,11 @@ class Nmcli:
         try:
             self._call(["nmcli", "connection", "up", HOTSPOT_CON])
         except WifiError:
-            self._hotspot_ensured = False  # NM may have lost the profile; re-check next time
+            try:
+                if not self._hotspot_profile_exists():
+                    self._hotspot_ensured = False  # NM lost the profile; re-create it next time
+            except WifiError:
+                pass  # unknown: keep the flag rather than rewrite the profile every tick
             raise
 
     def hotspot_clients(self) -> int:
@@ -161,7 +171,9 @@ class Nmcli:
         try:
             out = self._run(["iw", "dev", HOTSPOT_IFACE, "station", "dump"])
         except Exception as e:
-            log.debug("cannot count hotspot clients: %s", type(e).__name__)
+            log.log(logging.DEBUG if self._clients_warned else logging.WARNING,
+                    "cannot count hotspot clients: %s", type(e).__name__)
+            self._clients_warned = True
             return 0
         return sum(1 for line in out.splitlines() if line.startswith("Station "))
 
@@ -263,14 +275,18 @@ def read_scan_cache(path: Path) -> list[str]:
 
 # ---- watcher -----------------------------------------------------------
 
-def retry_skip_reason(nmcli) -> str | None:
-    """Why a due retry should leave the hotspot alone (None: go ahead and retry)."""
+def retry_skip_reason(nmcli, client_skips: int) -> tuple[str | None, bool]:
+    """Why a due retry should leave the hotspot alone, and whether that was a client skip.
+
+    A client that stays attached forever (a phone that auto-joined, no internet) must not
+    hold the Pi off the home network: after MAX_CLIENT_SKIPS skips the retry goes ahead.
+    """
     if not nmcli.known_wifi_profiles():
-        return "no saved Wi-Fi networks"
+        return "no saved Wi-Fi networks", False
     clients = nmcli.hotspot_clients()
-    if clients:
-        return f"{clients} client(s) connected"
-    return None
+    if clients and client_skips < MAX_CLIENT_SKIPS:
+        return f"{clients} client(s) connected", True
+    return None, False
 
 
 def watch(nmcli, config: Config, scan_cache: Path, *, clock: Callable[[], float] = time.monotonic,
@@ -279,6 +295,7 @@ def watch(nmcli, config: Config, scan_cache: Path, *, clock: Callable[[], float]
     """Apply `decide` every TICK_S seconds. `iterations` bounds the loop (for tests)."""
     last_connected = clock()
     hotspot_since: float | None = None
+    client_skips = 0  # consecutive due retries skipped because a client was attached
     retry_wait = config.hotspot_retry_s  # doubles after each failed retry, reset once connected
 
     def cache_scan() -> None:
@@ -304,6 +321,7 @@ def watch(nmcli, config: Config, scan_cache: Path, *, clock: Callable[[], float]
                 if connected:
                     last_connected = now
                     retry_wait = config.hotspot_retry_s
+                    client_skips = 0
                 if nmcli.hotspot_active():
                     hotspot_since = now if hotspot_since is None else hotspot_since
                 else:
@@ -316,11 +334,13 @@ def watch(nmcli, config: Config, scan_cache: Path, *, clock: Callable[[], float]
                     nmcli.stop_hotspot()
                     hotspot_since = None
                 elif action == "retry_known":
-                    skip = retry_skip_reason(nmcli)
+                    skip, client_skip = retry_skip_reason(nmcli, client_skips)
                     if skip:
+                        client_skips = client_skips + 1 if client_skip else 0
                         log.info("hotspot kept: %s", skip)
                         hotspot_since = now  # nothing to retry, or someone is mid-setup: wait again
                     else:
+                        client_skips = 0
                         nmcli.stop_hotspot()
                         hotspot_since = None
                         if nmcli.try_known_networks():
