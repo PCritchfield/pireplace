@@ -40,6 +40,8 @@ class Profile:
     ctype: str
     uuid: str
     sections: frozenset[str]
+    has_psk: bool = False
+    psk_expected_but_missing: bool = False
 
     @property
     def is_wifi(self) -> bool:
@@ -79,7 +81,15 @@ def _classify(data: bytes) -> Loaded:
                 break
         if not ssid:
             return Loaded("incomplete", data)
-    return Loaded("ok", data, Profile(ident, ctype, uuid, frozenset(parser.sections())))
+    has_psk = missing_psk = False
+    for section in ("wifi-security", "802-11-wireless-security"):
+        if parser.has_section(section):
+            sec = parser[section]
+            has_psk = bool(sec.get("psk", "").strip())
+            keymgmt = sec.get("key-mgmt", "").strip().lower()
+            missing_psk = keymgmt in ("wpa-psk", "sae") and not has_psk
+            break
+    return Loaded("ok", data, Profile(ident, ctype, uuid, frozenset(parser.sections()), has_psk, missing_psk))
 
 
 def _load(path: Path) -> Loaded:
@@ -191,6 +201,29 @@ def _unlink(path: Path) -> bool:
         return False
 
 
+KEEP_CORRUPT = 5
+
+
+def _trim_corrupt(backup: Path) -> None:
+    """Keep only the newest KEEP_CORRUPT `<name>.corrupt-<unix-ts>` copies per profile."""
+    groups: dict[str, list[tuple[int, str]]] = {}
+    try:
+        names = os.listdir(backup)
+    except OSError:
+        return
+    for fname in names:
+        base, sep, stamp = fname.rpartition(".corrupt-")
+        if sep and base.endswith(SUFFIX) and stamp.isdigit():
+            groups.setdefault(base, []).append((int(stamp), fname))
+    for items in groups.values():
+        for _, fname in sorted(items, reverse=True)[KEEP_CORRUPT:]:
+            try:
+                os.unlink(backup / fname)
+                log.info("removed old %s", fname)
+            except OSError:
+                pass
+
+
 def sync(live: Path, backup: Path) -> list[str]:
     """Copy valid live profiles into `backup`, pruning deleted or renamed ones.
 
@@ -211,11 +244,11 @@ def sync(live: Path, backup: Path) -> list[str]:
             continue
         try:
             if old:
-                lost = sorted(old.profile.sections - new.profile.sections)
-                if old.profile.uuid != new.profile.uuid or lost:
-                    why = "uuid changed" if old.profile.uuid != new.profile.uuid else f"live copy lost sections {lost}"
-                    log.warning("kept backup of %s: %s", name, why)
-                    problems.append(name)
+                if old.profile.has_psk and new.profile.psk_expected_but_missing:
+                    # Truncation signature, not a user edit: wpa-psk/sae without its psk.
+                    log.warning(
+                        "kept backup of %s: live copy lost its psk; if that is intended, "
+                        "run: python3 -m pireplace netbackup-forget %s", name, name)
                     continue
                 _write_atomic(backup, name + PREV, old.data)
             _write_atomic(backup, name, new.data)
@@ -227,6 +260,7 @@ def sync(live: Path, backup: Path) -> list[str]:
     if problems:  # an incomplete picture: remove nothing this run
         return problems
 
+    _trim_corrupt(backup)
     live_uuids = {p.profile.uuid: n for n, p in live_profiles.items()}
     for name in _listdir(backup):
         if not name.endswith(SUFFIX) or os.path.lexists(live / name):

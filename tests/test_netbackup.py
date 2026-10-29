@@ -121,28 +121,92 @@ def test_sync_keeps_backup_of_emptied_live_file(dirs):
     assert (backup / "home.nmconnection").read_text() == profile()
 
 
-def test_truncated_live_profile_never_replaces_a_full_backup(dirs, caplog):
+def test_incomplete_connection_only_live_profile_never_replaces_the_backup(dirs):
     live, backup = dirs
     put(live, "home.nmconnection", profile())
     netbackup.sync(live, backup)
-    put(live, "home.nmconnection", "[connection]\nid=home\ntype=wifi\nuuid=uuid-home\n\n[wifi]\nssid=home\n")
-    with caplog.at_level(logging.WARNING):
-        assert netbackup.sync(live, backup) == ["home.nmconnection"]
+    put(live, "home.nmconnection", "[connection]\nid=home\ntype=wifi\nuuid=uuid-home\n")
+    assert netbackup.sync(live, backup) == []
+    put(live, "home.nmconnection", "[connection]\nid=home\ntype=wifi\nuuid=uuid-home\n\n[wifi]\n")
+    assert netbackup.sync(live, backup) == []
     assert (backup / "home.nmconnection").read_text() == profile()
-    assert "kept backup of home.nmconnection" in caplog.text
-    assert SECRET not in caplog.text
-    put(live, "home.nmconnection", "[connection]\nid=home\ntype=wifi\nuuid=uuid-home\n")  # no ssid: ignored
+
+
+def test_complete_open_network_switch_replaces_and_keeps_prev(dirs):
+    live, backup = dirs
+    put(live, "home.nmconnection", profile())
     netbackup.sync(live, backup)
-    assert (backup / "home.nmconnection").read_text() == profile()
+    put(live, "home.nmconnection", profile(psk="x").split("[wifi-security]")[0])
+    assert netbackup.sync(live, backup) == []
+    assert "wifi-security" not in (backup / "home.nmconnection").read_text()
+    assert (backup / "home.nmconnection.prev").read_text() == profile()
 
 
-def test_changed_uuid_does_not_replace_the_backup(dirs):
+def test_same_name_new_uuid_replaces_and_keeps_prev(dirs):
     live, backup = dirs
     put(live, "home.nmconnection", profile())
     netbackup.sync(live, backup)
     put(live, "home.nmconnection", profile(uuid="another"))
-    assert netbackup.sync(live, backup) == ["home.nmconnection"]
+    assert netbackup.sync(live, backup) == []
+    assert "uuid=another" in (backup / "home.nmconnection").read_text()
+    assert (backup / "home.nmconnection.prev").read_text() == profile()
+
+
+def test_wpa_psk_without_psk_keeps_backup_warns_exits_zero_and_still_prunes(dirs, caplog):
+    live, backup = dirs
+    two_wifi(live, backup)
+    put(live, "third.nmconnection", profile("third"))
+    netbackup.sync(live, backup)
+    (live / "third.nmconnection").unlink()
+    broken = profile().replace("psk=" + SECRET, "key-mgmt=wpa-psk")
+    put(live, "home.nmconnection", broken)
+    with caplog.at_level(logging.WARNING):
+        assert netbackup.sync(live, backup) == []
     assert (backup / "home.nmconnection").read_text() == profile()
+    assert "kept backup of home.nmconnection" in caplog.text
+    assert "netbackup-forget home.nmconnection" in caplog.text
+    assert SECRET not in caplog.text
+    assert names(backup) == ["home.nmconnection", "other.nmconnection"]  # third was pruned
+    assert main(["netbackup-sync", "--live", str(live), "--backup", str(backup)]) == 0
+
+
+def test_incomplete_live_file_is_left_alone_at_warning_level(dirs, caplog):
+    live, backup = dirs
+    two_wifi(live, backup)
+    put(live, "home.nmconnection", "[connection]\nid=home\n")
+    with caplog.at_level(logging.DEBUG):
+        assert netbackup.restore(live, backup) == []
+    records = [r for r in caplog.records if "home.nmconnection" in r.getMessage()]
+    assert records and all(r.levelno == logging.WARNING for r in records)
+
+
+def test_only_the_five_newest_corrupt_copies_are_kept(dirs):
+    live, backup = dirs
+    two_wifi(live, backup)
+    for ts in range(100, 108):
+        (backup / f"home.nmconnection.corrupt-{ts}").write_text("x")
+    (backup / "other.nmconnection.corrupt-1").write_text("x")
+    netbackup.sync(live, backup)
+    kept = [n for n in names(backup) if n.startswith("home.nmconnection.corrupt-")]
+    assert kept == [f"home.nmconnection.corrupt-{ts}" for ts in range(103, 108)]
+    assert "other.nmconnection.corrupt-1" in names(backup)
+
+
+def test_restore_still_happens_when_the_corrupt_copy_cannot_be_saved(dirs, monkeypatch, caplog):
+    live, backup = dirs
+    two_wifi(live, backup)
+    put(live, "home.nmconnection", "no header here\n")
+    real = netbackup._write_atomic
+
+    def no_corrupt(directory, name, data):
+        if ".corrupt-" in name:
+            raise OSError(28, "full")
+        return real(directory, name, data)
+
+    monkeypatch.setattr(netbackup, "_write_atomic", no_corrupt)
+    with caplog.at_level(logging.WARNING):
+        assert netbackup.restore(live, backup) == ["home.nmconnection"]
+    assert "could not keep a copy" in caplog.text
 
 
 def test_failed_copy_skips_pruning(dirs, monkeypatch):
