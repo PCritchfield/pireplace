@@ -248,13 +248,57 @@ expected; join the main network.
 
 If the Pi has no connection for about 5 minutes it opens a Wi-Fi network called
 `pireplace-setup` (password: your `hotspot_password`). While it is up it retries
-known networks every 5 minutes. Join `pireplace-setup` on your phone, open
+known networks every 5 minutes, backing off to every 30 minutes after repeated
+failures. The hotspot stays up while a phone is connected to it, and when no Wi-Fi
+network is saved there is nothing to retry. Join `pireplace-setup` on your phone, open
 `http://10.42.0.1/setup`, pick the network and enter its password. The hotspot
 goes away once the Pi has joined. A brief router outage does not start the hotspot.
+The deploy also turns Wi-Fi power saving off, which causes dropouts on the Pi's radio.
 
 The setup page only exists while you are connected to the `pireplace-setup` hotspot:
 from the home network (or in laptop dev mode) `/setup` is "not found", so nobody on
 your Wi-Fi can change the Pi's network.
+
+## Network safety net
+
+NetworkManager once stored two profiles as netplan YAML and left them empty, which cost
+the Pi all networking. The deploy now guards against that:
+
+- Profiles are NetworkManager keyfiles only. The deploy reports (but never
+  migrates) any profile still stored as netplan YAML, with the manual
+  `nmcli connection migrate --plugin keyfile UUID` to run from a console, and a cloud-init drop-in stops cloud-init (the Raspberry Pi
+  Imager `network-config`) from rendering network config again.
+- Good profiles are copied to `/var/lib/pireplace-netbackup` (root only, mode 0700)
+  whenever `/etc/NetworkManager/system-connections` changes and once per boot
+  (`pireplace-netbackup.path` and `.service`). A profile you delete with `nmcli` is
+  dropped from the backup, unless that would leave no Wi-Fi profile at all.
+- Before NetworkManager starts, `pireplace-netrestore.service` puts a backed-up profile
+  back when its file is empty or invalid, and restores all of them when every Wi-Fi
+  profile (other than `pireplace-hotspot`) is gone. A valid profile is never overwritten.
+  NetworkManager does not depend on it, so a failure there cannot block networking.
+- The journal is persistent (the Pi default is volatile), capped at 64 MB on the SD
+  card and kept for a month. To look at the previous boot:
+
+      journalctl -b -1 -u pireplace-wifi
+      journalctl -k -b -1 | grep -i voltage
+
+A complete live profile replaces its backup; the three previous copies are kept as
+`NAME.prev.1` (newest) to `NAME.prev.3`. Recovering one is manual: as root, copy
+`NAME.prev.N` over `/etc/NetworkManager/system-connections/NAME`, then run
+`nmcli connection reload`. A
+truncated or incomplete one never does, nor does a WPA profile that lost its `psk` (a
+warning names the `netbackup-forget` fix). A live file the restore cannot read or
+understand is left alone; a bad file it replaces is kept in the backup directory as
+`NAME.corrupt-<time>` (the newest 5 per profile).
+
+To forget the only saved Wi-Fi network for good (the backup deliberately survives
+deleting the last Wi-Fi profile, so a mistake cannot leave the Pi offline), run:
+
+    sudo python3 -m pireplace netbackup-forget NAME.nmconnection
+
+with `PYTHONPATH=/opt/pireplace`.
+
+The backup holds Wi-Fi passwords; nothing here logs them.
 
 ## Laptop development
 

@@ -71,6 +71,12 @@
     pireplace_system_units:
       - pireplace-control.service
       - pireplace-wifi.service
+    # Safety net for the NetworkManager profiles (oneshots: installed and enabled, never
+    # restarted by the system-units handler).
+    pireplace_netbackup_units:
+      - pireplace-netrestore.service
+      - pireplace-netbackup.service
+      - pireplace-netbackup.path
     # Jellyfin music sync. Optional inventory vars: pireplace_jellyfin_api_key (turns it
     # on), pireplace_jellyfin_url, pireplace_jellyfin_user_id, pireplace_jellyfin_playlists
     # and pireplace_tailscale_authkey. Play vars outrank inventory vars, so the defaults
@@ -155,6 +161,8 @@
           - pipewire-pulse
           - wireplumber
           - network-manager
+          # iw: counts hotspot clients (pireplace-wifi) and switches Wi-Fi power saving off.
+          - iw
           # polkit evaluates 50-pireplace.rules; dbus-user-session gives the lingering
           # pireplace user manager its session bus (PipeWire, systemctl --user --machine=).
           - polkitd
@@ -462,6 +470,17 @@
         group: root
         mode: "0644"
 
+    # No NetworkManager restart here: the playbook usually runs over Wi-Fi and a restart
+    # would drop the SSH session. The handler reloads the conf and applies it to wlan0 now.
+    - name: Turn Wi-Fi power saving off for NetworkManager connections
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../networkmanager/pireplace-wifi-powersave.conf"
+        dest: /etc/NetworkManager/conf.d/pireplace-wifi-powersave.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Apply Wi-Fi power saving
+
     - name: Install system units
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../systemd/{{ item }}"
@@ -473,6 +492,16 @@
       notify:
         - Reload systemd
         - Restart pireplace system services
+
+    - name: Install the NetworkManager profile backup and restore units
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../systemd/{{ item }}"
+        dest: /etc/systemd/system/{{ item }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pireplace_netbackup_units }}"
+      notify: Reload systemd
 
     - name: Install the Jellyfin sync units (service and timer)
       ansible.builtin.copy:
@@ -630,6 +659,43 @@
         - NetworkManager.service
         - avahi-daemon.service
 
+    # Profiles must live as NetworkManager keyfiles. NM once wrote netplan YAML in place
+    # (/etc/netplan/90-NM-*.yaml) and left the files empty, which cost the Pi all networking.
+    # -e no keeps ':' in values unescaped; the UUID has none, so split at the first ':'.
+    - name: List the NetworkManager profiles and where they are stored
+      ansible.builtin.command:
+        argv: [nmcli, -g, "UUID,FILENAME", -e, "no", connection, show]
+      register: pireplace_nm_profiles
+      changed_when: false
+      check_mode: false
+
+    # Report only: migrating a possibly active profile over the Wi-Fi SSH session is untested
+    # and could drop access. Do it by hand from a console if this ever lists anything.
+    - name: Report profiles still stored as netplan YAML (never migrated automatically)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: NetworkManager profiles stored as netplan YAML (UUID:FILE):
+          {{ pireplace_netplan_profiles | join(', ') }}. netplan storage can leave profiles
+          empty. From a console (not over Wi-Fi SSH) run, for each UUID:
+          sudo nmcli connection migrate --plugin keyfile UUID
+      vars:
+        pireplace_netplan_profiles: >-
+          {{ pireplace_nm_profiles.stdout_lines
+             | select('match', '^[^:]*:(/etc/netplan/|/run/NetworkManager/system-connections/netplan-)')
+             | list }}
+      when: pireplace_netplan_profiles | length > 0
+
+    - name: Enable the NetworkManager profile backup, restore and watcher
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+      loop: "{{ pireplace_netbackup_units }}"
+
+    - name: Start the profile watcher
+      ansible.builtin.systemd_service:
+        name: pireplace-netbackup.path
+        state: started
+
     - name: Enable and start the control page and Wi-Fi watcher
       ansible.builtin.systemd_service:
         name: "{{ item }}"
@@ -637,12 +703,57 @@
         state: started
       loop: "{{ pireplace_system_units }}"
 
+    # Best effort: a failing first backup must not fail the deploy (the unit retries on
+    # every profile change and every boot).
+    - name: Back up the NetworkManager profiles once now
+      ansible.builtin.command:
+        argv: [systemctl, start, pireplace-netbackup.service]
+      register: pireplace_netbackup_first
+      changed_when: false
+      failed_when: false
+
+    - name: Warn when the first profile backup failed
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the first NetworkManager profile backup failed (exit
+          {{ pireplace_netbackup_first.rc }}). See `journalctl -u pireplace-netbackup`.
+      when: pireplace_netbackup_first.rc | default(0) != 0
+
     - name: Enable and start the Jellyfin sync timer
       ansible.builtin.systemd_service:
         name: pireplace-sync.timer
         enabled: true
         state: started
       when: pireplace_jf_enabled
+
+    # --- persistent journal ----------------------------------------------------
+
+    # Raspberry Pi OS ships 40-rpi-volatile-storage.conf (Storage=volatile); 90- sorts after it.
+    - name: Create the journald drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Keep the journal across reboots, capped for the SD card
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../journald/90-pireplace-persistent.conf"
+        dest: /etc/systemd/journald.conf.d/90-pireplace-persistent.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart journald
+
+    - name: Make sure the persistent journal directory exists
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
+        owner: root
+        group: systemd-journal
+        mode: "2755"
+      notify: Restart journald
 
     # --- quiet TV --------------------------------------------------------------
 
@@ -685,13 +796,26 @@
 
     # Imager's first-boot settings (user, Wi-Fi via netplan, hostname) are already
     # applied and persist without cloud-init. To undo: delete this file.
-    - name: Ensure /etc/cloud exists
+    - name: Ensure /etc/cloud and /etc/cloud/cloud.cfg.d exist
       ansible.builtin.file:
-        path: /etc/cloud
+        path: "{{ item }}"
         state: directory
         owner: root
         group: root
         mode: "0755"
+      loop:
+        - /etc/cloud
+        - /etc/cloud/cloud.cfg.d
+
+    # Never let cloud-init (Raspberry Pi Imager's /boot/firmware/network-config) render
+    # netplan network config again.
+    - name: Install the cloud-init drop-in that disables network config
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../cloud-init/99-pireplace-no-network.cfg"
+        dest: /etc/cloud/cloud.cfg.d/99-pireplace-no-network.cfg
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Disable cloud-init so its per-boot stages stay off the TV
       ansible.builtin.file:
@@ -737,8 +861,28 @@
       ansible.builtin.systemd_service:
         daemon_reload: true
 
+    - name: Restart journald
+      ansible.builtin.systemd_service:
+        name: systemd-journald.service
+        state: restarted
+
+    - name: Move the volatile journal to disk
+      ansible.builtin.command:
+        argv: [journalctl, --flush]
+      listen: Restart journald
+      changed_when: true
+
     - name: Apply tmpfiles
       ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/pireplace.conf
+      changed_when: true
+
+    - name: Apply Wi-Fi power saving
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          nmcli general reload conf
+          iw dev wlan0 set power_save off || true
+        executable: /bin/bash
       changed_when: true
 
     - name: Restart pireplace system services

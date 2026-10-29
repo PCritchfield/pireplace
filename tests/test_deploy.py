@@ -12,6 +12,8 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 UNITS = ROOT / "deploy" / "systemd"
 SYSTEM_UNITS = ["pireplace-control.service", "pireplace-wifi.service"]
+# Root oneshots: the hardening applies, but they never restart (no Restart=always).
+NETBACKUP_SERVICES = ["pireplace-netrestore.service", "pireplace-netbackup.service"]
 USER_UNITS = ["pireplace-video.service", "pireplace-music.service"]
 
 
@@ -58,6 +60,81 @@ HARDENING = {
 def test_system_units_are_hardened(name):
     service = unit(name)["Service"]
     assert {k: service.get(k, [None])[-1] for k in HARDENING} == HARDENING
+
+
+@pytest.mark.parametrize("name", NETBACKUP_SERVICES)
+def test_netbackup_oneshots_are_hardened_and_offline(name):
+    service = unit(name)["Service"]
+    assert {k: service.get(k, [None])[-1] for k in HARDENING} == HARDENING
+    assert service["Type"] == ["oneshot"]
+    assert service["ProtectSystem"] == ["strict"]
+    assert service["PrivateNetwork"] == ["yes"]
+    assert service["CapabilityBoundingSet"] == [""]
+    assert service["TimeoutStartSec"] == ["30s" if "restore" in name else "60s"]
+    writable = set(service["ReadWritePaths"][0].split())
+    if "restore" in name:  # rewrites NM's directory; '-' so a missing dir cannot fail the sandbox
+        assert writable == {"-/etc/NetworkManager/system-connections", "/var/lib/pireplace-netbackup"}
+    else:  # only reads NM's directory
+        assert writable == {"/var/lib/pireplace-netbackup"}
+        assert service["ReadOnlyPaths"] == ["-/etc/NetworkManager/system-connections"]
+    assert service["StateDirectoryMode"] == ["0700"]
+    assert "Restart" not in service  # a oneshot must not loop
+
+
+def test_netrestore_runs_before_networkmanager_which_never_requires_it():
+    parsed = unit("pireplace-netrestore.service")
+    assert parsed["Unit"]["Before"] == ["NetworkManager.service"]
+    assert parsed["Unit"]["DefaultDependencies"] == ["no"]
+    assert parsed["Unit"]["After"] == ["local-fs.target"]
+    assert parsed["Install"]["WantedBy"] == ["NetworkManager.service"]
+    for key in ("Requires", "BindsTo", "Requisite"):
+        assert key not in parsed["Unit"]
+    for name in NETBACKUP_SERVICES:  # nothing in the units makes NM depend on a backup unit
+        assert "RequiredBy" not in unit(name).get("Install", {})
+
+
+def test_netbackup_runs_after_networkmanager_on_changes_and_once_per_boot():
+    service = unit("pireplace-netbackup.service")
+    assert service["Unit"]["After"] == ["NetworkManager.service pireplace-netrestore.service"]
+    assert service["Service"]["ExecStartPre"] == ["/bin/sleep 2"]
+    assert service["Install"]["WantedBy"] == ["multi-user.target"]
+    path = unit("pireplace-netbackup.path")
+    assert path["Path"]["PathChanged"] == ["/etc/NetworkManager/system-connections"]
+    assert path["Path"]["Unit"] == ["pireplace-netbackup.service"]
+    assert path["Path"]["TriggerLimitIntervalSec"] == ["0"]
+    assert path["Install"]["WantedBy"] == ["multi-user.target"]
+
+
+def test_cloud_init_dropin_disables_network_config():
+    text = (ROOT / "deploy" / "cloud-init" / "99-pireplace-no-network.cfg").read_text()
+    assert "network: {config: disabled}" in text.splitlines()
+
+
+def test_journald_dropin_is_persistent_capped_and_sorts_after_the_pi_default():
+    path = ROOT / "deploy" / "journald" / "90-pireplace-persistent.conf"
+    assert path.name > "40-rpi-volatile-storage.conf"
+    settings = dict(
+        line.split("=", 1) for line in path.read_text().splitlines() if "=" in line and not line.startswith("#")
+    )
+    assert settings["Storage"] == "persistent"
+    assert settings["SystemMaxUse"] == "64M"
+    assert settings["SystemMaxFileSize"] == "8M"
+    assert settings["SystemKeepFree"] == "1G"
+    assert settings["MaxRetentionSec"] == "1month"
+
+
+def test_playbook_installs_the_safety_net_files():
+    for name in ("pireplace-netrestore.service", "pireplace-netbackup.service", "pireplace-netbackup.path"):
+        assert (UNITS / name).is_file() and name in SITE
+    for src, dest in (
+        ("cloud-init/99-pireplace-no-network.cfg", "/etc/cloud/cloud.cfg.d/99-pireplace-no-network.cfg"),
+        ("journald/90-pireplace-persistent.conf", "/etc/systemd/journald.conf.d/90-pireplace-persistent.conf"),
+    ):
+        assert (ROOT / "deploy" / src).is_file() and src in SITE and dest in SITE
+    assert "nmcli" in SITE and "migrate" in SITE and "/etc/netplan/" in SITE
+    assert "/run/NetworkManager/system-connections/netplan-" in SITE
+    play = yaml.safe_load(SITE)[1]
+    assert "pireplace-netbackup" not in " ".join(play["vars"]["pireplace_system_units"])
 
 
 @pytest.mark.parametrize("name", SYSTEM_UNITS + USER_UNITS)
@@ -742,3 +819,75 @@ def test_validation_play_refuses_placeholders(tmp_path, extra, ok):
     assert (result.returncode == 0) is ok, result.stdout
     if not ok:
         assert "CHANGE_ME placeholder" in result.stdout
+
+
+# ---- Wi-Fi power saving --------------------------------------------------
+
+POWERSAVE_CONF = ROOT / "deploy" / "networkmanager" / "pireplace-wifi-powersave.conf"
+
+
+def test_powersave_conf_turns_wifi_power_saving_off():
+    lines = [l for l in POWERSAVE_CONF.read_text().splitlines() if l and not l.startswith("#")]
+    assert lines == ["[connection]", "wifi.powersave = 2"]
+
+
+def test_playbook_installs_iw():
+    packages = SITE.split("- name: Install packages", 1)[1].split("- name:", 1)[0]
+    assert "- iw" in packages
+
+
+def test_playbook_installs_powersave_conf_without_restarting_networkmanager():
+    task = next(t for t in _tasks() if "pireplace-wifi-powersave.conf" in str(t.get("ansible.builtin.copy", {})))
+    copy = task["ansible.builtin.copy"]
+    assert copy["src"].endswith("/../networkmanager/pireplace-wifi-powersave.conf")
+    assert copy["dest"] == "/etc/NetworkManager/conf.d/pireplace-wifi-powersave.conf"
+    assert (copy["owner"], copy["group"], copy["mode"]) == ("root", "root", "0644")
+    assert task["notify"] == "Apply Wi-Fi power saving"
+    # A restart would drop the SSH session the playbook runs over.
+    handlers = {h["name"]: h for h in yaml.safe_load(SITE)[1]["handlers"]}
+    assert "ansible.builtin.systemd_service" not in str(handlers["Apply Wi-Fi power saving"])
+    assert "restart" not in str(handlers["Apply Wi-Fi power saving"]).lower()
+
+
+def test_powersave_handler_reloads_conf_and_tolerates_a_missing_wlan0():
+    handlers = {h["name"]: h for h in yaml.safe_load(SITE)[1]["handlers"]}
+    steps = handlers["Apply Wi-Fi power saving"]["ansible.builtin.shell"]["cmd"].splitlines()
+    cmds = [l.strip() for l in steps if l.strip()]
+    assert cmds.pop(0) == "set -e"  # a failed reload must fail the play; only the iw step is optional
+    assert cmds[0] == "nmcli general reload conf"
+    assert cmds[1].startswith("iw dev wlan0 set power_save off") and cmds[1].endswith("|| true")
+
+
+def test_netplan_profiles_are_reported_never_migrated_automatically():
+    task = next(t for t in _tasks() if "Report profiles still stored as netplan" in t["name"])
+    assert "ansible.builtin.debug" in task and "nmcli connection migrate --plugin keyfile" in task["ansible.builtin.debug"]["msg"]
+    assert "console" in task["ansible.builtin.debug"]["msg"]
+    for t in _tasks():  # nothing runs a migrate
+        assert "migrate" not in str(t.get("ansible.builtin.command", "")) + str(t.get("ansible.builtin.shell", ""))
+    pattern = re.search(r"select\('match', '([^']+)'\)", str(task["vars"]["pireplace_netplan_profiles"])).group(1)
+    for line, listed in (
+        ("u1:/etc/netplan/90-NM-x.yaml", True),
+        ("u2:/run/NetworkManager/system-connections/netplan-NM-x.nmconnection", True),
+        ("u3:/run/NetworkManager/system-connections/lo.nmconnection", False),
+        ("u4:/run/NetworkManager/system-connections/tailscale0.nmconnection", False),
+        ("u5:/etc/NetworkManager/system-connections/home.nmconnection", False),
+    ):
+        assert bool(re.match(pattern, line)) is listed
+    assert "is defined" not in task["when"] and "length > 0" in task["when"]
+
+
+def test_first_backup_warning_survives_check_mode():
+    task = next(t for t in _tasks() if "Warn when the first profile backup failed" in t["name"])
+    assert "default(0)" in task["when"]
+
+
+def test_netbackup_service_cannot_trip_the_start_limit():
+    assert unit("pireplace-netbackup.service")["Unit"]["StartLimitIntervalSec"] == ["0"]
+
+
+def test_first_profile_backup_cannot_fail_the_play_and_runs_after_the_services():
+    tasks = _tasks()
+    names = [t["name"] for t in tasks]
+    first = names.index("Back up the NetworkManager profiles once now")
+    assert first > names.index("Enable and start the control page and Wi-Fi watcher")
+    assert tasks[first]["failed_when"] is False and "register" in tasks[first]

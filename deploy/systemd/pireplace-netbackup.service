@@ -1,0 +1,45 @@
+[Unit]
+Description=pireplace: back up good NetworkManager profiles
+After=NetworkManager.service pireplace-netrestore.service
+# A burst of PathChanged triggers must never trip the start limit and stop the watcher.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60s
+Environment=PYTHONPATH=/opt/pireplace
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Let a PathChanged trigger on NM's temp file settle, so the final file is read.
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/python3 -m pireplace netbackup-sync
+ReadOnlyPaths=-/etc/NetworkManager/system-connections
+ReadWritePaths=/var/lib/pireplace-netbackup
+StateDirectory=pireplace-netbackup
+StateDirectoryMode=0700
+
+# Hardening, as pireplace-netrestore.service.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+# Also runs once per boot (the path unit only fires on changes).
+WantedBy=multi-user.target

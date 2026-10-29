@@ -55,14 +55,182 @@ def test_connect_open_network_omits_password():
     assert "password" not in calls[-1]
 
 
-def test_start_and_stop_hotspot_commands():
+def test_stop_hotspot_command():
     calls = []
-    n = Nmcli(lambda c: calls.append(c) or "")
+    Nmcli(lambda c: calls.append(c) or "").stop_hotspot()
+    assert calls == [["nmcli", "connection", "down", "pireplace-hotspot"]]
+
+
+class ProfileNm:
+    """A runner that behaves like nmcli for the hotspot profile: tracks one profile."""
+
+    def __init__(self, exists=False, ssid="pireplace-setup", psk="12345678", read_fails=False, up_fails=0,
+                 up_removes=True):
+        self.exists, self.ssid, self.psk = exists, ssid, psk
+        self.read_fails, self.up_fails, self.up_removes = read_fails, up_fails, up_removes
+        self.calls = []
+
+    def __call__(self, cmd):
+        self.calls.append(cmd)
+        if cmd[:3] == ["nmcli", "-t", "-f"] and cmd[3] in ("NAME", "NAME,TYPE"):
+            return "pireplace-hotspot\n" if self.exists else "Wired\n"
+        if "-g" in cmd:
+            if self.read_fails:
+                raise subprocess.CalledProcessError(1, cmd, stderr=f"boom {self.psk}")
+            return f"{self.ssid}\n{self.psk}\n"
+        if cmd[:3] == ["nmcli", "connection", "add"]:
+            self.exists = True
+        if cmd[:3] == ["nmcli", "connection", "up"] and self.up_fails:
+            self.up_fails -= 1
+            self.exists = self.exists and not self.up_removes
+            raise subprocess.CalledProcessError(10, cmd)
+        return ""
+
+    def writes(self):
+        return [c for c in self.calls if c[:3] in (["nmcli", "connection", "add"], ["nmcli", "connection", "modify"])]
+
+    def ups(self):
+        return [c for c in self.calls if c[:3] == ["nmcli", "connection", "up"]]
+
+
+def test_ensure_hotspot_profile_creates_it_when_missing():
+    run = ProfileNm(exists=False)
+    Nmcli(run).ensure_hotspot_profile("pireplace-setup", "12345678")
+    assert run.writes() == [[
+        "nmcli", "connection", "add", "type", "wifi", "ifname", "wlan0", "con-name", "pireplace-hotspot",
+        "autoconnect", "no", "ssid", "pireplace-setup", "802-11-wireless.mode", "ap",
+        "ipv4.method", "shared", "ipv6.method", "ignore",
+        "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn", "wifi-sec.pairwise", "ccmp",
+        "wifi-sec.group", "ccmp", "wifi-sec.psk", "12345678"]]
+
+
+def test_ensure_hotspot_profile_writes_nothing_when_it_matches():
+    run = ProfileNm(exists=True)
+    Nmcli(run).ensure_hotspot_profile("pireplace-setup", "12345678")
+    assert run.writes() == []
+    assert ["nmcli", "-e", "no", "-s", "-g", "802-11-wireless.ssid,802-11-wireless-security.psk",
+            "connection", "show", "pireplace-hotspot"] in run.calls
+
+
+@pytest.mark.parametrize("stored", [dict(psk="old-password"), dict(ssid="old-ssid"), dict(read_fails=True)])
+def test_ensure_hotspot_profile_modifies_once_when_it_differs_or_cannot_be_read(stored):
+    run = ProfileNm(exists=True, **stored)
+    Nmcli(run).ensure_hotspot_profile("pireplace-setup", "12345678")
+    assert run.writes() == [["nmcli", "connection", "modify", "pireplace-hotspot",
+                             "802-11-wireless.ssid", "pireplace-setup", "wifi-sec.psk", "12345678"]]
+
+
+def test_ensure_hotspot_profile_errors_never_contain_the_password():
+    def run(cmd):
+        if cmd[3] == "NAME":
+            return ""
+        raise subprocess.CalledProcessError(4, cmd, stderr=f"bad {SECRET}")
+    with pytest.raises(WifiError) as ei:
+        Nmcli(run).ensure_hotspot_profile("x", SECRET)
+    assert SECRET not in str(ei.value) and SECRET not in repr(ei.value)
+
+
+def test_failed_modify_error_never_contains_the_password():
+    def run(cmd):
+        if cmd[3] == "NAME":
+            return "pireplace-hotspot\n"
+        if "-g" in cmd:
+            return "x\nstale-psk-value\n"
+        raise subprocess.CalledProcessError(4, cmd, stderr=f"bad {SECRET} stale-psk-value")
+    with pytest.raises(WifiError) as ei:
+        Nmcli(run).ensure_hotspot_profile("x", SECRET)
+    assert SECRET not in str(ei.value) and "stale-psk-value" not in str(ei.value)
+
+
+def test_start_hotspot_ensures_once_then_only_activates():
+    run = ProfileNm(exists=False)
+    n = Nmcli(run)
     n.start_hotspot("pireplace-setup", "12345678")
-    n.stop_hotspot()
-    assert calls[0] == ["nmcli", "device", "wifi", "hotspot", "ifname", "wlan0", "con-name",
-                        "pireplace-hotspot", "ssid", "pireplace-setup", "password", "12345678"]
-    assert calls[1] == ["nmcli", "connection", "down", "pireplace-hotspot"]
+    n.start_hotspot("pireplace-setup", "12345678")
+    assert len(run.writes()) == 1
+    assert run.ups() == [["nmcli", "connection", "up", "pireplace-hotspot"]] * 2
+    assert not any(c[:3] == ["nmcli", "device", "wifi"] for c in run.calls)
+
+
+def test_start_hotspot_reensures_after_connection_up_fails():
+    run = ProfileNm(exists=False, up_fails=1)  # NM "deletes" the profile when up fails
+    n = Nmcli(run)
+    with pytest.raises(WifiError):
+        n.start_hotspot("pireplace-setup", "12345678")
+    n.start_hotspot("pireplace-setup", "12345678")
+    assert len(run.writes()) == 2  # created, lost, created again
+    assert len(run.ups()) == 2
+
+
+def test_up_failure_with_the_profile_still_there_does_not_rewrite_it():
+    run = ProfileNm(exists=False, up_removes=False)
+    n = Nmcli(run)
+    n.start_hotspot("pireplace-setup", "12345678")  # creates the profile
+    run.up_fails = 1
+    with pytest.raises(WifiError):
+        n.start_hotspot("pireplace-setup", "12345678")
+    run.calls.clear()
+    n.start_hotspot("pireplace-setup", "12345678")
+    assert run.writes() == [] and not any("-g" in c for c in run.calls)
+    assert len(run.ups()) == 1
+
+
+def test_ensure_compares_a_psk_with_colon_and_backslash_without_writing():
+    psk = "pa:ss\\word1"
+    run = ProfileNm(exists=True, psk=psk)
+    Nmcli(run).ensure_hotspot_profile("pireplace-setup", psk)
+    assert run.writes() == []
+    assert ["nmcli", "-e", "no"] == [c for c in run.calls if "-g" in c][0][:3]
+
+
+def test_blank_stored_psk_does_not_mangle_later_error_messages():
+    n = Nmcli(ProfileNm(exists=True, psk=""))
+    n.ensure_hotspot_profile("pireplace-setup", "12345678")
+    assert "" not in n._secrets
+
+    def run(cmd):
+        raise subprocess.CalledProcessError(4, cmd, stderr="No suitable device")
+    n._run = run
+    with pytest.raises(WifiError) as ei:
+        n.connect("Home", "12345678")
+    assert str(ei.value).endswith("No suitable device")
+
+
+def test_hotspot_clients_warns_on_the_first_failure_only(caplog):
+    def run(cmd):
+        raise FileNotFoundError("iw")
+    n = Nmcli(run)
+    caplog.set_level(logging.DEBUG)
+    n.hotspot_clients()
+    n.hotspot_clients()
+    levels = [r.levelno for r in caplog.records if "hotspot clients" in r.getMessage()]
+    assert levels == [logging.WARNING, logging.DEBUG]
+
+
+IW_DUMP = (
+    "Station aa:bb:cc:dd:ee:01 (on wlan0)\n\tinactive time:\t10 ms\n\tsignal:  -40 dBm\n"
+    "Station aa:bb:cc:dd:ee:02 (on wlan0)\n\tinactive time:\t20 ms\n"
+)
+
+
+def test_hotspot_clients_counts_stations():
+    calls = []
+    n = Nmcli(lambda c: calls.append(c) or IW_DUMP)
+    assert n.hotspot_clients() == 2
+    assert calls == [["iw", "dev", "wlan0", "station", "dump"]]
+
+
+@pytest.mark.parametrize("exc", [subprocess.CalledProcessError(1, ["iw"]), FileNotFoundError("iw"),
+                                 subprocess.TimeoutExpired(["iw"], 30)])
+def test_hotspot_clients_is_zero_on_any_error(exc):
+    def run(cmd):
+        raise exc
+    assert Nmcli(run).hotspot_clients() == 0
+
+
+def test_known_wifi_profiles_skips_the_hotspot_and_ethernet():
+    out = "Home:802-11-wireless\nOld:802-11-wireless\npireplace-hotspot:802-11-wireless\nWired:802-3-ethernet\n"
+    assert Nmcli(lambda c: out).known_wifi_profiles() == ["Home", "Old"]
 
 
 ACTIVE = "Home:802-11-wireless:wlan0\nlo:loopback:lo\n"
@@ -347,9 +515,16 @@ def test_connect_marks_busy_marker_during_connect(setup_srv, fake_nm):
 # ---- watcher -----------------------------------------------------------
 
 class WatchNm:
-    def __init__(self, connected=False, hotspot=False, known_ok=False):
+    def __init__(self, connected=False, hotspot=False, known_ok=False, profiles=("Home",), clients=0):
         self._connected, self._hotspot, self.known_ok = connected, hotspot, known_ok
+        self.profiles, self.clients = list(profiles), clients
         self.calls = []
+
+    def known_wifi_profiles(self):
+        return self.profiles
+
+    def hotspot_clients(self):
+        return self.clients
 
     def connected(self):
         return self._connected
@@ -571,3 +746,136 @@ def test_non_wifi_error_in_connect_logs_only_type_name(setup_srv, fake_nm, caplo
     assert code == 202 and SECRET not in data.decode()
     assert fake_nm.done.wait(5) and wait_for(lambda: "CalledProcessError" in caplog.text)
     assert SECRET not in caplog.text
+
+
+# ---- calmer retries ----------------------------------------------------
+
+def retry_calls(calls):
+    return [c for c in calls if c in ("stop_hotspot", "try_known")]
+
+
+def test_watch_keeps_the_hotspot_when_no_wifi_is_saved(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    nm, clock, cache = WatchNm(profiles=[]), Clock(), tmp_path / "s.json"
+    run_watch(nm, make_config(tmp_path), cache, clock, iterations=31)
+    nm.calls.clear()
+    run_watch(nm, make_config(tmp_path), cache, clock, iterations=31)  # retry timer fires
+    assert nm.calls == []  # no stop, no start, no scan
+    assert caplog.text.count("hotspot kept: no saved Wi-Fi networks") == 1
+
+
+def test_watch_keeps_the_hotspot_while_a_client_is_connected(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    nm, clock, cache = WatchNm(clients=1), Clock(), tmp_path / "s.json"
+    run_watch(nm, make_config(tmp_path), cache, clock, iterations=31)
+    nm.calls.clear()
+    run_watch(nm, make_config(tmp_path), cache, clock, iterations=31)
+    assert nm.calls == []
+    assert caplog.text.count("hotspot kept: 1 client(s) connected") == 1
+
+
+def test_a_client_that_never_leaves_cannot_block_the_retry_forever(tmp_path):
+    nm, clock = WatchNm(clients=1), Clock()
+    stops = stamp(nm, clock, "stop_hotspot")
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=130)  # t = 0..1290
+    # hotspot at 300; due at 600 and 900 (skipped), 3rd expiry at 1200 retries anyway
+    assert stops == [1200]
+    assert "try_known" in nm.calls
+
+
+class TimedClock(Clock):
+    """A Clock that runs scripted changes when time passes a given second."""
+
+    def __init__(self, script):
+        super().__init__()
+        self.script = sorted(script, key=lambda x: x[0])
+
+    def sleep(self, s):
+        super().sleep(s)
+        while self.script and self.t >= self.script[0][0]:
+            self.script.pop(0)[1]()
+
+
+def stamp(nm, clock, name):
+    """Record the time of each call to nm.<name>."""
+    stamps, orig = [], getattr(nm, name)
+    setattr(nm, name, lambda *a: stamps.append(clock.t) or orig(*a))
+    return stamps
+
+
+def test_watch_skip_resets_the_timer_and_retries_once_the_client_leaves(tmp_path):
+    nm = WatchNm(clients=1)
+    clock = TimedClock([(700, lambda: setattr(nm, "clients", 0))])
+    stops = stamp(nm, clock, "stop_hotspot")
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=100)  # t = 0..990
+    # hotspot at 300; due at 600 but a client is there; timer restarts at 600; due again at 900
+    assert stops == [900]
+
+
+def test_watch_retry_wait_doubles_after_each_failure_up_to_1800(tmp_path):
+    nm, clock = WatchNm(), Clock()
+    stamps = []
+    orig = nm.try_known_networks
+    nm.try_known_networks = lambda: stamps.append(clock.t) or orig()
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=800)
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert gaps[:3] == [600, 1200, 1800]
+    assert all(g == 1800 for g in gaps[2:]) and len(gaps) >= 4
+
+
+def test_watch_retry_wait_resets_after_reconnect(tmp_path):
+    nm = WatchNm()
+
+    def reconnect():
+        nm._connected, nm._hotspot = True, True
+
+    clock = TimedClock([(700, reconnect), (710, lambda: setattr(nm, "_connected", False))])
+    tries, starts = stamp(nm, clock, "try_known_networks"), stamp(nm, clock, "start_hotspot")
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=200)  # t = 0..1990
+    # hotspot 300, retry fails at 600 (wait now 600); reconnect at 700 resets the wait;
+    # hotspot again after the grace; the next retry comes 300 s later, not 600
+    assert tries[0] == 600 and starts[:2] == [300, 600]
+    assert starts[2] - 0 > 710 and tries[1] - starts[2] == 300
+
+
+def test_decide_uses_the_wait_it_is_given():
+    assert decide(now=700, last_connected=0, hotspot_since=400, connected=False,
+                  after_s=300, retry_s=600) == "none"
+    assert decide(now=1000, last_connected=0, hotspot_since=400, connected=False,
+                  after_s=300, retry_s=600) == "retry_known"
+
+
+class SimNm:
+    """Real Nmcli over a fake nmcli: no Wi-Fi, no saved profiles, hotspot toggles on up/down."""
+
+    def __init__(self):
+        self.profile = False
+        self.hotspot = False
+        self.calls = []
+
+    def __call__(self, cmd):
+        self.calls.append(cmd)
+        if cmd[:4] == ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION"]:
+            return "wlan0:wifi:connected:pireplace-hotspot\n" if self.hotspot else "wlan0:wifi:disconnected:\n"
+        if cmd[:4] == ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE"]:
+            return "pireplace-hotspot:802-11-wireless:wlan0\n" if self.hotspot else ""
+        if cmd[:4] == ["nmcli", "-t", "-f", "NAME"]:
+            return "pireplace-hotspot\n" if self.profile else ""
+        if cmd[:3] == ["nmcli", "connection", "add"]:
+            self.profile = True
+        if cmd[:3] == ["nmcli", "connection", "up"]:
+            self.hotspot = True
+        if cmd[:3] == ["nmcli", "connection", "down"]:
+            self.hotspot = False
+        return ""
+
+
+def test_an_hour_without_wifi_writes_the_hotspot_profile_at_most_once(tmp_path):
+    sim = SimNm()
+    clock = Clock()
+    nm = Nmcli(sim, clock=clock)
+    run_watch(nm, make_config(tmp_path), tmp_path / "s.json", clock, iterations=360)
+    writes = [c for c in sim.calls if c[:3] in (["nmcli", "connection", "add"], ["nmcli", "connection", "modify"])]
+    assert len(writes) == 1
+    assert sim.hotspot
+    assert not any(c[:3] == ["nmcli", "connection", "down"] for c in sim.calls)

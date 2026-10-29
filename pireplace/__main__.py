@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ from pireplace.config import ConfigError, load_config, load_jellyfin_config, rea
 from pireplace.controller import Fireplace
 from pireplace.jellyfin import JellyfinClient
 from pireplace.mpv import MpvClient
+from pireplace import netbackup
 from pireplace.state import State, StateStore
 from pireplace.sync import music_playing, run_sync, trigger_rescan
 from pireplace.web import make_server
@@ -157,6 +159,36 @@ def cmd_sync(args: argparse.Namespace) -> int:
     )
 
 
+def _netbackup(action: Callable[[], int]) -> int:
+    """Run a netbackup action; failures print a short message (never file contents)."""
+    try:
+        return action()
+    except netbackup.NetbackupError as e:
+        print(f"pireplace: {e}", file=sys.stderr)
+    except OSError as e:
+        print(f"pireplace: netbackup: {os.strerror(e.errno) if e.errno else 'I/O error'}", file=sys.stderr)
+    return 1
+
+
+def cmd_netbackup_sync(args: argparse.Namespace) -> int:
+    return _netbackup(lambda: 1 if netbackup.sync(Path(args.live), Path(args.backup)) else 0)
+
+
+def cmd_netbackup_restore(args: argparse.Namespace) -> int:
+    return _netbackup(lambda: (netbackup.restore(Path(args.live), Path(args.backup)), 0)[1])
+
+
+def cmd_netbackup_forget(args: argparse.Namespace) -> int:
+    def forget() -> int:
+        removed = netbackup.forget(Path(args.backup), args.name)
+        if not removed:
+            print(f"pireplace: no backup of {args.name}", file=sys.stderr)
+            return 1
+        return 0
+
+    return _netbackup(forget)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="pireplace")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -172,6 +204,20 @@ def main(argv: list[str]) -> int:
     sync = sub.add_parser("sync", help="mirror the Jellyfin mood playlists into the music folders")
     sync.add_argument("--config", default=DEFAULT_CONFIG, help="path to config.toml")
     sync.set_defaults(func=cmd_sync)
+
+    for name, func, text in (
+        ("netbackup-sync", cmd_netbackup_sync, "copy good NetworkManager profiles into the backup"),
+        ("netbackup-restore", cmd_netbackup_restore, "restore empty or lost NetworkManager profiles"),
+    ):
+        nb = sub.add_parser(name, help=text)
+        nb.add_argument("--live", default=netbackup.DEFAULT_LIVE, help="NetworkManager keyfile directory")
+        nb.add_argument("--backup", default=netbackup.DEFAULT_BACKUP, help="backup directory")
+        nb.set_defaults(func=func)
+
+    forget = sub.add_parser("netbackup-forget", help="drop one profile from the backup (so it is not restored)")
+    forget.add_argument("name", help="file name, e.g. HomeWifi.nmconnection")
+    forget.add_argument("--backup", default=netbackup.DEFAULT_BACKUP, help="backup directory")
+    forget.set_defaults(func=cmd_netbackup_forget)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
