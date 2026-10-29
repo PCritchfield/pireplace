@@ -3,7 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from pireplace.config import ConfigError, load_config, load_jellyfin_config, read_api_key
+from pireplace.config import (
+    ConfigError, Season, audio_profile, load_config, load_jellyfin_config, read_api_key,
+)
 
 
 def test_empty_file_gives_defaults(tmp_path):
@@ -218,3 +220,64 @@ def test_read_api_key_uses_the_process_environment_by_default(tmp_path, monkeypa
     (creds / "jellyfin.key").write_text("env-key")
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(creds))
     assert read_api_key(replace(cfg, api_key_file=tmp_path / "nope")) == "env-key"
+
+
+# --- [seasons] ---
+
+def test_seasons_parsed_in_file_order(tmp_path):
+    p = _write(tmp_path, '[seasons.fall]\nlabel = "Fall"\nmoods = ["harvest", "thanksgiving"]\n'
+                         '[seasons.winter]\nlabel = "Winter"\nmoods = ["modern"]\n')
+    assert load_config(p).seasons == (
+        Season("fall", "Fall", ("harvest", "thanksgiving")),
+        Season("winter", "Winter", ("modern",)),
+    )
+
+
+def test_no_seasons_section_gives_empty_tuple(tmp_path):
+    assert load_config(_write(tmp_path, "")).seasons == ()
+
+
+def test_season_rejects_mood_in_two_seasons(tmp_path):
+    p = _write(tmp_path, '[seasons.fall]\nlabel = "Fall"\nmoods = ["cozy"]\n'
+                         '[seasons.winter]\nlabel = "Winter"\nmoods = ["cozy"]\n')
+    with pytest.raises(ConfigError, match="cozy"):
+        load_config(p)
+
+
+@pytest.mark.parametrize("body", [
+    '[seasons.fall]\nlabel = "Fall"\nmoods = []\n',
+    '[seasons.fall]\nlabel = ""\nmoods = ["a"]\n',
+])
+def test_season_rejects_empty_moods_and_label(tmp_path, body):
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, body))
+
+
+@pytest.mark.parametrize("body", [
+    '[seasons."Fall!"]\nlabel = "Fall"\nmoods = ["a"]\n',
+    '[seasons.fall]\nlabel = "Fall"\nmoods = ["Bad Name"]\n',
+])
+def test_season_rejects_bad_names(tmp_path, body):
+    with pytest.raises(ConfigError):
+        load_config(_write(tmp_path, body))
+
+
+# --- jellyfin audio profile ---
+
+def _jf(tmp_path, extra=""):
+    body = JF_TOML.replace('api_key_file =', extra + '\napi_key_file =', 1)
+    return load_jellyfin_config(_write(tmp_path, body))
+
+
+def test_jellyfin_audio_defaults_to_opus_160(tmp_path):
+    j = load_jellyfin_config(_write(tmp_path, JF_TOML))
+    assert j.audio_format == "opus" and j.audio_bitrate_kbps == 160
+    assert audio_profile(j) == "opus-160"
+
+
+def test_jellyfin_audio_original_and_range(tmp_path):
+    assert audio_profile(_jf(tmp_path, 'audio_format = "original"')) == "original"
+    assert audio_profile(_jf(tmp_path, "audio_bitrate_kbps = 96")) == "opus-96"
+    for bad in ('audio_format = "mp3"', "audio_bitrate_kbps = 32", "audio_bitrate_kbps = 321"):
+        with pytest.raises(ConfigError):
+            _jf(tmp_path, bad)
