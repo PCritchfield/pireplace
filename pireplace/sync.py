@@ -17,6 +17,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import unicodedata
 import urllib.request
 from collections.abc import Callable
@@ -38,6 +39,11 @@ MAX_EXT_BYTES = 16
 ORIGINAL = "original"
 UNKNOWN_DURATION_ESTIMATE = 10 * 1024**2  # bytes assumed for a transcode of unknown length
 MIN_TRANSCODE_CAP = 1024**2  # floor of the per-file size cap passed to the client
+DURATION_SLACK_S = 2.0  # a transcode may differ from the track's duration by this much,
+DURATION_SLACK = 0.02  # or by this fraction of it, whichever is larger
+OGG_HEADER = 27  # bytes of an Ogg page header before its segment table
+OPUS_HEAD_LEN = 19  # the OpusHead packet
+OGG_TAIL = 64 * 1024  # an Ogg page is at most 65307 bytes; the last one is in this tail
 
 _BAD_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f\x7f]')
 # The tail of a name track_filename() makes: " [<8 chars of the Id>].<ext>".
@@ -115,16 +121,85 @@ def _transcode_cap(track: Track, bitrate_kbps: int) -> int | None:
     return max(MIN_TRANSCODE_CAP, math.ceil(3 * _expected_bytes(track.duration_s, bitrate_kbps)))
 
 
-def _is_adoptable_transcode(path: Path, track: Track, bitrate_kbps: int) -> bool:
-    """A transcode left by a crashed run: a regular Ogg file of a plausible size."""
+def _open_nofollow(path: Path):
+    return os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb")
+
+
+def _last_granule(tail: bytes) -> int | None:
+    """Granule position of the Ogg page that ends exactly at the end of `tail`."""
+    end = len(tail)
+    while (i := tail.rfind(b"OggS", 0, end)) >= 0:
+        end = i
+        nseg_at = i + 26
+        if nseg_at >= len(tail) or tail[i + 4] != 0:  # incomplete header or not version 0
+            continue
+        table = tail[nseg_at + 1:nseg_at + 1 + tail[nseg_at]]
+        if len(table) == tail[nseg_at] and nseg_at + 1 + len(table) + sum(table) == len(tail):
+            granule = int.from_bytes(tail[i + 6:i + 14], "little", signed=True)
+            return granule if granule >= 0 else None
+    return None
+
+
+def ogg_duration_s(path: Path) -> float | None:
+    """Length of an Opus-in-Ogg file from its headers; None if it cannot be read.
+
+    (granule of the last page - OpusHead pre-skip) / 48000. The last page is the one
+    that ends exactly at the end of the file, so a stream cut mid-page has none.
+    """
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(fd, "rb") as f:
+        with _open_nofollow(path) as f:
+            head = f.read(OGG_HEADER + 255 + OPUS_HEAD_LEN)
+            size = os.fstat(f.fileno()).st_size
+            f.seek(max(0, size - OGG_TAIL))
+            tail = f.read()
+    except OSError:
+        return None
+    if len(head) < OGG_HEADER or head[:4] != b"OggS" or head[4] != 0:
+        return None
+    start = OGG_HEADER + head[26]
+    packet = head[start:start + OPUS_HEAD_LEN]
+    if len(packet) < OPUS_HEAD_LEN or packet[:8] != b"OpusHead":
+        return None
+    pre_skip = int.from_bytes(packet[10:12], "little")
+    granule = _last_granule(tail)
+    if granule is None or granule <= pre_skip:
+        return None
+    return (granule - pre_skip) / 48000
+
+
+def _transcode_problem(path: Path, track: Track, bitrate_kbps: int) -> str | None:
+    """Why the transcode at `path` must not be used for `track`; None if it may.
+
+    An Ogg stream of a plausible size and, when Jellyfin gave the track's duration,
+    an Opus duration within max(2 s, 2%) of it: a cut-short stream is never accepted.
+    """
+    try:
+        with _open_nofollow(path) as f:
             head = f.read(4)
             size = os.fstat(f.fileno()).st_size
+    except OSError as e:
+        return f"cannot read the transcode: {e.strerror}"
+    if head != b"OggS":
+        return "transcode is not an Ogg stream"
+    duration = track.duration_s
+    if not plausible_size(size, duration, bitrate_kbps):
+        return f"transcode of {size} bytes is implausible for {duration} s at {bitrate_kbps} kbps"
+    if duration is not None:
+        got = ogg_duration_s(path)
+        if got is None:
+            return "cannot read the transcode's duration"
+        if abs(got - duration) > max(DURATION_SLACK_S, DURATION_SLACK * duration):
+            return f"transcode lasts {got:.1f} s, the track {duration:.1f} s"
+    return None
+
+
+def _regular_size(path: Path) -> int | None:
+    """Size of a regular file (never through a symlink); None otherwise."""
+    try:
+        st = os.lstat(path)
     except OSError:
-        return False
-    return head == b"OggS" and plausible_size(size, track.duration_s, bitrate_kbps)
+        return None
+    return st.st_size if stat.S_ISREG(st.st_mode) else None
 
 
 def _is_safe_name(name: object) -> bool:
@@ -139,36 +214,44 @@ def _is_safe_name(name: object) -> bool:
     )
 
 
-def _load_manifest(mood_dir: Path) -> tuple[dict[str, str], dict[str, str], bool, str | None]:
-    """Return (items, profiles, dirty, problem); problem is "missing", "corrupt" or None.
+def _load_manifest(
+    mood_dir: Path,
+) -> tuple[dict[str, str], dict[str, str], set[str], bool, str | None]:
+    """Return (items, profiles, stale, dirty, problem); problem is "missing", "corrupt" or None.
 
     Unsafe entries are dropped (never deleted). ``profiles`` has an entry for every
     item; one missing from the file (an old manifest) or not a string is "original".
+    ``stale`` holds bare names of replaced files whose deletion is still owed.
     A manifest that exists but cannot be read raises OSError: guessing it empty would
     orphan every synced file.
     """
     try:
         text = (mood_dir / MANIFEST).read_text(encoding="utf-8")
     except FileNotFoundError:
-        return {}, {}, False, "missing"
+        return {}, {}, set(), False, "missing"
     except UnicodeDecodeError:
-        return {}, {}, False, "corrupt"
+        return {}, {}, set(), False, "corrupt"
     try:
         data = json.loads(text)
         items = data["items"]
         if not isinstance(items, dict):
             raise TypeError
         raw_profiles = data.get("profiles", {})
+        raw_stale = data.get("stale", [])
     except (ValueError, KeyError, TypeError, AttributeError):
-        return {}, {}, False, "corrupt"
+        return {}, {}, set(), False, "corrupt"
     if not isinstance(raw_profiles, dict):
         raw_profiles = {}
+    if not isinstance(raw_stale, list):
+        raw_stale = []
     clean = {k: v for k, v in items.items() if isinstance(k, str) and _is_safe_name(v)}
     profiles = {}
     for k in clean:
         p = raw_profiles.get(k)
         profiles[k] = p if isinstance(p, str) and p else ORIGINAL
-    return clean, profiles, len(clean) != len(items), None
+    stale = {n for n in raw_stale if _is_safe_name(n)}
+    dirty = len(clean) != len(items) or len(stale) != len(raw_stale)
+    return clean, profiles, stale, dirty, None
 
 
 def _warn_if_ownership_reset(mood: str, mood_dir: Path, problem: str | None) -> None:
@@ -187,14 +270,59 @@ def _warn_if_ownership_reset(mood: str, mood_dir: Path, problem: str | None) -> 
     )
 
 
-def _write_manifest(mood_dir: Path, items: dict[str, str], profiles: dict[str, str]) -> None:
-    data = {"items": items, "profiles": {i: profiles.get(i, ORIGINAL) for i in items}}
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_manifest(
+    mood_dir: Path, items: dict[str, str], profiles: dict[str, str], stale: set[str],
+) -> None:
+    """Durably replace the manifest: fsynced tmp file, rename, fsynced directory."""
+    data = {
+        "items": items,
+        "profiles": {i: profiles.get(i, ORIGINAL) for i in items},
+        "stale": sorted(stale),
+    }
     tmp = mood_dir / f".{MANIFEST}.tmp"
     try:
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.unlink(missing_ok=True)  # never written through a planted symlink
+        with open(tmp, "x", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, mood_dir / MANIFEST)
     finally:
         tmp.unlink(missing_ok=True)
+    _fsync_dir(mood_dir)
+
+
+def _delete_stale(mood: str, mood_dir: Path, stale: set[str], items: dict[str, str], result: MoodResult) -> set[str]:
+    """Delete owed old files; return the names still owed (their delete failed).
+
+    A name some item still records is never deleted, only dropped from the list.
+    """
+    in_use = set(items.values())
+    left = set()
+    for name in sorted(stale):
+        if name in in_use:
+            continue
+        path = mood_dir / name
+        if path.parent != mood_dir:  # defence in depth; _is_safe_name already ensures this
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            result.delete_failed += 1
+            left.add(name)
+            log.warning("mood=%s: cannot delete replaced file %s (retried next run): %s", mood, name, e)
+            continue
+        result.removed += 1
+        log.info("mood=%s deleted replaced file %s", mood, name)
+    return left
 
 
 def sync_mood(
@@ -226,8 +354,19 @@ def _sync_mood(
     transcode = profile != ORIGINAL
     ext = "ogg" if transcode else None
     mood_dir.mkdir(parents=True, exist_ok=True)
-    manifest, profiles, changed, problem = _load_manifest(mood_dir)
+    manifest, profiles, stale, changed, problem = _load_manifest(mood_dir)
     _warn_if_ownership_reset(mood, mood_dir, problem)
+
+    # Old files an earlier run replaced but could not delete: retried first.
+    if stale:
+        left = _delete_stale(mood, mood_dir, stale, manifest, result)
+        if left != stale:
+            stale = left
+            try:
+                _write_manifest(mood_dir, manifest, profiles, stale)
+            except OSError:
+                result.error = "cannot write manifest"
+                return
 
     try:
         listed = client.playlist_tracks(playlist_id)
@@ -247,16 +386,29 @@ def _sync_mood(
     to_fetch: list[tuple[Track, str]] = []
     adopted: dict[str, str] = {}
     for t in tracks.values():
+        name = track_filename(t, ext)
+        if transcode and t.id not in manifest:
+            # After an ownership reset, an original file of the size Jellyfin reports is
+            # ours: owned again as "original", so it is migrated and then deleted.
+            orig = track_filename(t)
+            if orig != name and t.size is not None and _regular_size(mood_dir / orig) == t.size:
+                manifest[t.id] = orig
+                profiles[t.id] = ORIGINAL
+                changed = True
+                log.info("mood=%s item=%s: adopted %s as original", mood, t.id, orig)
         old = manifest.get(t.id)
         if old is not None and profiles[t.id] == profile:
             continue  # current
-        name = track_filename(t, ext)
+        if transcode and old is not None and t.duration_s is None:
+            # A transcode of unknown length cannot be checked: never trade a good file for it.
+            log.info("mood=%s item=%s: duration unknown; keeping original %s", mood, t.id, old)
+            continue
         path = mood_dir / name
         # A file already at the name (a crashed run, a lost manifest) is adopted if it
         # checks out; otherwise it is downloaded again. The track's own old-profile
         # file is never adopted as the new one, even when the names match.
         if name != old and path.is_file() and not path.is_symlink() and (
-            _is_adoptable_transcode(path, t, bitrate_kbps) if transcode
+            _transcode_problem(path, t, bitrate_kbps) is None if transcode
             else t.size in (None, path.stat().st_size)
         ):
             adopted[t.id] = name
@@ -273,14 +425,14 @@ def _sync_mood(
         result.error = "not enough space for downloads; nothing changed"
         return
 
-    # Old-profile files replaced by a new one: deleted with the others, after every
-    # download, and only once the new file is in place and recorded.
-    superseded: list[tuple[str, str]] = []
+    # Old-profile files replaced by a new one. They become "stale" (owed deletes, kept
+    # in the manifest until done) only once the new file is in place and recorded.
+    superseded: list[str] = []
 
     def record(item_id: str, name: str) -> None:
         old = manifest.get(item_id)
         if old is not None and old != name:
-            superseded.append((item_id, old))
+            superseded.append(old)
         manifest[item_id] = name
         profiles[item_id] = profile
         result.added += 1
@@ -290,11 +442,13 @@ def _sync_mood(
 
     # J8: download first, then delete, so a run cut short never leaves a mood with
     # fewer tracks than it had.
+    reasons: list[str] = []
     for index, (t, name) in enumerate(to_fetch):
         if free_bytes(mood_dir) - need(t) < MIN_FREE_RUN:
-            left = len(to_fetch) - index
-            result.failed += left
-            log.warning("mood=%s: free space would drop below 1 GB; %d downloads left for later", mood, left)
+            left_over = len(to_fetch) - index
+            result.failed += left_over
+            reasons.append("free space would drop below 1 GB")
+            log.warning("mood=%s: free space would drop below 1 GB; %d downloads left for later", mood, left_over)
             break
         part = mood_dir / f".{name}.part"
         try:
@@ -304,11 +458,9 @@ def _sync_mood(
                 cap = _transcode_cap(t, bitrate_kbps)
                 kwargs = {} if cap is None else {"max_bytes": cap}
                 client.download_transcoded(t.id, part, bitrate_kbps, **kwargs)
-                size = part.stat().st_size
-                if not plausible_size(size, t.duration_s, bitrate_kbps):
-                    raise JellyfinError(
-                        f"transcode of {size} bytes is implausible for {t.duration_s} s at {bitrate_kbps} kbps"
-                    )
+                why = _transcode_problem(part, t, bitrate_kbps)
+                if why is not None:
+                    raise JellyfinError(why)
             else:
                 client.download(t.id, part)
             os.replace(part, mood_dir / name)
@@ -316,15 +468,28 @@ def _sync_mood(
             with suppress(OSError):
                 part.unlink(missing_ok=True)
             result.failed += 1
+            reasons.append(str(e))
             log.warning("mood=%s item=%s: %s", mood, t.id, e)
             continue
         record(t.id, name)
         log.info("mood=%s downloaded %s", mood, name)
 
-    # Delete only manifest-recorded bare filenames, and never one still in use.
     keep = {manifest[i] for i in manifest if i not in to_delete} | {n for _, n in to_fetch}
-    doomed = [(i, n, True) for i, n in to_delete.items()] + [(i, n, False) for i, n in superseded]
-    for item_id, name, forget in doomed:
+    replaced = {n for n in superseded if n not in keep}
+    stale |= replaced
+
+    # The new files and the manifest naming them are on disk before anything is deleted,
+    # so a power cut cannot leave a track with neither its old nor its new file.
+    if (changed or result.added) and (stale or to_delete):
+        try:
+            _fsync_dir(mood_dir)
+            _write_manifest(mood_dir, manifest, profiles, stale)
+        except OSError:
+            result.error = "cannot write manifest"
+            return
+
+    # Delete only manifest-recorded bare filenames, and never one still in use.
+    for item_id, name in to_delete.items():
         if name not in keep:
             path = mood_dir / name
             if path.parent != mood_dir:  # defence in depth; _is_safe_name already ensures this
@@ -335,20 +500,21 @@ def _sync_mood(
                 result.delete_failed += 1
                 log.warning("mood=%s item=%s: cannot delete %s: %s", mood, item_id, name, e)
                 continue
-        if forget:
-            del manifest[item_id]
-            profiles.pop(item_id, None)
+        del manifest[item_id]
+        profiles.pop(item_id, None)
         result.removed += 1
+    if replaced:
+        stale = (stale - replaced) | _delete_stale(mood, mood_dir, replaced, manifest, result)
 
-    if changed or result.added or result.removed:
+    if changed or result.added or result.removed or superseded:
         try:
-            _write_manifest(mood_dir, manifest, profiles)
+            _write_manifest(mood_dir, manifest, profiles, stale)
         except OSError:
             result.error = "cannot write manifest"
             return
     problems = []
     if result.failed:
-        problems.append(f"{result.failed} downloads failed")
+        problems.append(f"{result.failed} downloads failed (first: {reasons[0]})")
     if result.delete_failed:
         problems.append(f"{result.delete_failed} deletes failed")
     if result.skipped:
@@ -448,3 +614,4 @@ def run_sync(
         changed = changed or bool(result.added or result.removed)
     _rescan_when_quiet(config.music_dir, changed, rescan, playing)
     return 1 if failed else 0
+

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -121,7 +122,7 @@ def test_failed_download_counts_and_retries_next_run(tmp_path):
     a, b = T("a"), T("b")
     res = run(FakeClient([a, b], fail_ids=[b.id]), tmp_path)
     assert (res.added, res.failed) == (1, 1)
-    assert res.error == "1 downloads failed"
+    assert res.error == "1 downloads failed (first: boom)"
     assert list((tmp_path / "modern").glob(".*.part")) == []
     assert set(manifest(tmp_path)) == {a.id}
     c = FakeClient([a, b])
@@ -186,7 +187,7 @@ def test_running_low_on_space_stops_midway(tmp_path):
     res = run(c, tmp_path, free=lambda p: next(levels))
     assert c.downloads == ["a" * 8]
     assert (res.added, res.failed) == (1, 2)
-    assert res.error == "2 downloads failed"
+    assert res.error == "2 downloads failed (first: free space would drop below 1 GB)"
 
 
 @pytest.mark.parametrize("artist,title,expect", [
@@ -705,7 +706,8 @@ def test_unreadable_manifest_is_a_mood_error_not_a_reset(tmp_path, monkeypatch):
 import math
 
 from pireplace.jellyfin import JellyfinClient
-from pireplace.sync import estimate_bytes, plausible_size
+from pireplace import sync as sync_mod
+from pireplace.sync import estimate_bytes, ogg_duration_s, plausible_size
 from tests.fake_jellyfin import FakeJellyfin
 
 PL = "p" * 32
@@ -729,10 +731,28 @@ def jitem(id_, title, seconds, container="flac", size=30_000_000):
     }
 
 
-def ogg_body(seconds, kbps=160):
-    """A body of exactly the expected transcode size: plausible."""
-    n = int(seconds * kbps * 1000 / 8)
-    return b"OggS" + b"\0" * (n - 4)
+def ogg_page(granule, payload, header_type=0):
+    segs = [255] * (len(payload) // 255) + [len(payload) % 255]
+    return (b"OggS" + bytes([0, header_type]) + granule.to_bytes(8, "little", signed=True)
+            + b"\1\0\0\0" + b"\0" * 8 + bytes([len(segs)]) + bytes(segs) + payload)
+
+
+def opus_head(pre_skip=312):
+    return b"OpusHead" + bytes([1, 2]) + pre_skip.to_bytes(2, "little") + (48000).to_bytes(4, "little") + b"\0\0\0"
+
+
+LAST_PAGE_LEN = len(ogg_page(0, b"\x01" * 100, 4))
+
+
+def ogg_body(seconds, kbps=160, actual=None, size_s=None, pre_skip=312):
+    """A minimal Opus-in-Ogg stream: an OpusHead page, filler, and a last page whose
+    granule says `actual` seconds (default `seconds`). Its size is that of `size_s`
+    seconds at `kbps` (default `seconds`): plausible."""
+    n = int((seconds if size_s is None else size_s) * kbps * 1000 / 8)
+    granule = pre_skip + round((seconds if actual is None else actual) * 48000)
+    head = ogg_page(0, opus_head(pre_skip), 2)
+    last = ogg_page(granule, b"\x01" * 100, 4)
+    return head + b"\0" * max(0, n - len(head) - len(last)) + last
 
 
 def jtrack(id_, title, seconds, container="flac", size=30_000_000):
@@ -856,7 +876,8 @@ def test_failed_transcode_keeps_flac(fake, tmp_path):
     fake.transcodes = {A: ogg_body(10), B: ogg_body(12)}
     fake.fail[f"/Audio/{B}/stream.ogg"] = 403
     res = opus_run(jclient(fake), tmp_path)
-    assert res.failed == 1 and res.error
+    assert res.failed == 1
+    assert res.error == f"1 downloads failed (first: HTTP 403 from /Audio/{B}/stream.ogg)"
     assert files(tmp_path) == sorted([track_filename(ta, "ogg"), track_filename(tb)])
     m = full_manifest(tmp_path)
     assert m["items"] == {A: track_filename(ta, "ogg"), B: track_filename(tb)}
@@ -1046,3 +1067,216 @@ def test_run_sync_passes_profile_and_bitrate(tmp_path):
     assert got == [96]
     m = json.loads((tmp_path / "music" / "modern" / MANIFEST).read_text())
     assert m["profiles"] == {A: "opus-96"}
+
+
+# --- fix round 1: Ogg duration check, durable manifest, stale deletes, reset, reasons ---
+
+
+def test_ogg_duration_s_reads_granule_and_pre_skip(tmp_path):
+    f = tmp_path / "x.ogg"
+    f.write_bytes(ogg_body(10, actual=7.5))
+    assert ogg_duration_s(f) == pytest.approx(7.5)
+    # an "OggS" in the audio data near the end is not mistaken for the last page
+    body = ogg_body(10)
+    f.write_bytes(body[:-LAST_PAGE_LEN] + b"xxOggS\0\0" + b"\xff" * 40 + body[-LAST_PAGE_LEN:])
+    assert ogg_duration_s(f) == pytest.approx(10)
+
+
+@pytest.mark.parametrize("data", [
+    b"",
+    b"OggS" + b"\0" * 5000,  # no OpusHead
+    ogg_page(0, opus_head(), 2),  # header only: granule 0 is before the pre-skip
+    ogg_page(0, b"NotOpus" + b"\0" * 12, 2) + ogg_page(480000, b"\1" * 10),
+    ogg_body(10)[:-30],  # last page cut off
+])
+def test_ogg_duration_s_unparseable_is_none(tmp_path, data):
+    f = tmp_path / "x.ogg"
+    f.write_bytes(data)
+    assert ogg_duration_s(f) is None
+
+
+def test_cut_short_transcode_of_plausible_size_is_rejected(fake, tmp_path):
+    ta = jtrack(A, "Long", 240)
+    flac_mood(tmp_path, [ta])
+    fake.playlists[PL] = [jitem(A, "Long", 240)]
+    fake.transcodes = {A: ogg_body(240, actual=70, size_s=70)}  # 29%: passes the size floor
+    res = opus_run(jclient(fake), tmp_path)
+    assert res.failed == 1 and "first:" in res.error
+    assert files(tmp_path) == [track_filename(ta)]
+    assert full_manifest(tmp_path)["items"] == {A: track_filename(ta)}
+    assert list((tmp_path / "modern").glob(".*.part")) == []
+
+
+@pytest.mark.parametrize("actual,ok", [(240, True), (235.3, True), (234.9, False), (245, False)])
+def test_transcode_duration_tolerance(tmp_path, actual, ok):
+    ta = jtrack(A, "Long", 240)
+    flac_mood(tmp_path, [ta])
+
+    class C(FakeClient):
+        def download_transcoded(self, item_id, dest, bitrate_kbps, max_bytes=None):
+            Path(dest).write_bytes(ogg_body(240, actual=actual))
+            return 1
+
+    res = opus_run(C([ta]), tmp_path)
+    want = track_filename(ta, "ogg") if ok else track_filename(ta)
+    assert files(tmp_path) == [want]
+    assert (res.failed == 0) is ok
+
+
+def test_adopted_ogg_must_have_the_right_duration(tmp_path):
+    ta = jtrack(A, "One", 10)
+    mood = flac_mood(tmp_path, [ta])
+    (mood / track_filename(ta, "ogg")).write_bytes(ogg_body(10, actual=3, size_s=10))
+    got = []
+
+    class C(FakeClient):
+        def download_transcoded(self, item_id, dest, bitrate_kbps, max_bytes=None):
+            got.append(item_id)
+            Path(dest).write_bytes(ogg_body(10))
+            return 1
+
+    res = opus_run(C([ta]), tmp_path)
+    assert got == [A] and res.error is None
+    assert ogg_duration_s(mood / track_filename(ta, "ogg")) == pytest.approx(10)
+
+
+def test_unknown_duration_existing_flac_is_not_migrated(tmp_path, caplog):
+    t = Track(A, "Art", "One", "flac", 10, None)
+    flac_mood(tmp_path, [t])
+
+    class C(FakeClient):
+        def download_transcoded(self, *a, **k):
+            raise AssertionError("must keep the original")
+
+    with caplog.at_level(logging.INFO):
+        res = opus_run(C([t]), tmp_path)
+    assert (res.added, res.removed, res.failed, res.error) == (0, 0, 0, None)
+    assert files(tmp_path) == [track_filename(t)]
+    assert "duration unknown; keeping original" in caplog.text
+
+
+def test_unknown_duration_new_track_is_accepted(tmp_path):
+    t = Track(A, "Art", "One", "flac", 10, None)
+
+    class C(FakeClient):
+        def download_transcoded(self, item_id, dest, bitrate_kbps, max_bytes=None):
+            Path(dest).write_bytes(b"OggS" + b"\0" * 100)
+            return 104
+
+    res = opus_run(C([t]), tmp_path)
+    assert (res.added, res.error) == (1, None)
+    assert files(tmp_path) == [track_filename(t, "ogg")]
+    assert full_manifest(tmp_path)["profiles"] == {A: "opus-160"}
+
+
+def _migrating(fake, tmp_path):
+    ta, tb = jtrack(A, "One", 10), jtrack(B, "Two", 12)
+    flac_mood(tmp_path, [ta, tb])
+    fake.playlists[PL] = [jitem(A, "One", 10), jitem(B, "Two", 12)]
+    fake.transcodes = {A: ogg_body(10), B: ogg_body(12)}
+    return ta, tb
+
+
+def test_manifest_write_failure_before_deletes_keeps_every_flac(fake, tmp_path, monkeypatch):
+    ta, tb = _migrating(fake, tmp_path)
+
+    def broken(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sync_mod, "_write_manifest", broken)
+    res = opus_run(jclient(fake), tmp_path)
+    assert res.error == "cannot write manifest"
+    mood = tmp_path / "modern"
+    assert (mood / track_filename(ta)).exists() and (mood / track_filename(tb)).exists()
+
+
+def test_manifest_and_dir_are_fsynced_before_deletes(fake, tmp_path, monkeypatch, flac_unlinks):
+    _migrating(fake, tmp_path)
+    events = flac_unlinks
+    real = os.fsync
+
+    def fsync(fd):
+        events.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+        return real(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    res = opus_run(jclient(fake), tmp_path)
+    assert res.error is None
+    first_unlink = next(i for i, (k, _) in enumerate(events) if k == "unlink")
+    before = [p for k, p in events[:first_unlink] if k == "fsync"]
+    mood = str(tmp_path / "modern")
+    assert any(p.endswith(f".{MANIFEST}.tmp") for p in before)
+    # the directory is synced after the manifest rename, still before any delete
+    tmp_at = max(i for i, p in enumerate(before) if p.endswith(f".{MANIFEST}.tmp"))
+    assert mood in before[tmp_at:]
+
+
+def test_failed_delete_of_old_file_is_kept_as_stale_and_retried(fake, tmp_path, monkeypatch):
+    ta, tb = _migrating(fake, tmp_path)
+    real = Path.unlink
+
+    def unlink(self, *a, **k):
+        if self.name == track_filename(ta):
+            raise PermissionError("busy")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    res = opus_run(jclient(fake), tmp_path)
+    assert res.delete_failed == 1 and "1 deletes failed" in res.error
+    m = full_manifest(tmp_path)
+    assert m["stale"] == [track_filename(ta)]
+    assert m["items"] == {A: track_filename(ta, "ogg"), B: track_filename(tb, "ogg")}
+    assert (tmp_path / "modern" / track_filename(ta)).exists()
+
+    monkeypatch.setattr(Path, "unlink", real)
+    fake.requests.clear()
+    res = opus_run(jclient(fake), tmp_path)
+    assert res.error is None and res.removed == 1
+    assert not any("/stream.ogg" in p for p, _ in fake.requests)
+    assert full_manifest(tmp_path)["stale"] == []
+    assert files(tmp_path) == sorted([track_filename(ta, "ogg"), track_filename(tb, "ogg")])
+
+
+def test_stale_name_still_in_items_or_unsafe_is_never_deleted(tmp_path):
+    ta = jtrack(A, "One", 10)
+    mood = tmp_path / "modern"
+    mood.mkdir()
+    name = track_filename(ta, "ogg")
+    (mood / name).write_bytes(ogg_body(10))
+    (mood / ".hidden").write_bytes(b"keep")
+    (tmp_path / "outside.flac").write_bytes(b"keep")
+    (mood / MANIFEST).write_text(json.dumps({
+        "items": {A: name}, "profiles": {A: "opus-160"},
+        "stale": [name, "../outside.flac", ".hidden", 7],
+    }))
+    res = opus_run(FakeClient([ta]), tmp_path)
+    assert res.error is None
+    assert (mood / name).exists() and (tmp_path / "outside.flac").exists()
+    assert (mood / ".hidden").exists()
+    assert full_manifest(tmp_path)["stale"] == []
+
+
+def test_ownership_reset_adopts_flac_as_original_then_migrates(fake, tmp_path):
+    ta = jtrack(A, "One", 10, size=len(b"fLaC-" + A.encode()))
+    mood = flac_mood(tmp_path, [ta])
+    (mood / MANIFEST).write_text("{corrupt")
+    fake.playlists[PL] = [jitem(A, "One", 10, size=ta.size)]
+    fake.transcodes = {A: ogg_body(10)}
+    res = opus_run(jclient(fake), tmp_path)
+    assert res.error is None
+    assert files(tmp_path) == [track_filename(ta, "ogg")]
+    m = full_manifest(tmp_path)
+    assert m["items"] == {A: track_filename(ta, "ogg")}
+    assert m["profiles"] == {A: "opus-160"} and m["stale"] == []
+
+
+def test_ownership_reset_leaves_a_flac_of_the_wrong_size(fake, tmp_path):
+    ta = jtrack(A, "One", 10, size=999)
+    mood = flac_mood(tmp_path, [ta])
+    (mood / MANIFEST).unlink()
+    fake.playlists[PL] = [jitem(A, "One", 10, size=999)]
+    fake.transcodes = {A: ogg_body(10)}
+    res = opus_run(jclient(fake), tmp_path)
+    assert res.error is None
+    assert files(tmp_path) == sorted([track_filename(ta), track_filename(ta, "ogg")])
+    assert full_manifest(tmp_path)["items"] == {A: track_filename(ta, "ogg")}
