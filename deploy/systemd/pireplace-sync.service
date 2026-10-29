@@ -1,0 +1,69 @@
+[Unit]
+Description=pireplace music sync from Jellyfin
+Wants=network-online.target
+After=network-online.target tailscaled.service
+# A failed run (exit 1: server or Tailscale down, some downloads failed) is retried
+# every 10 minutes, at most 4 starts in 6 hours; then the next night's timer tries again.
+StartLimitIntervalSec=6h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=10min
+# Exit status 2 is a config error or an unreadable token; retrying cannot fix that.
+RestartPreventExitStatus=2
+# The first sync over a relay takes about an hour; never let a run hang for longer
+# than this (each file also has its own 15-minute limit).
+TimeoutStartSec=6h
+User=pireplace
+Group=pireplace
+WorkingDirectory=/opt/pireplace
+Environment=PYTHONPATH=/opt/pireplace
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m pireplace sync --config /etc/pireplace/config.toml
+# Keep the fire and music smooth while it downloads.
+Nice=10
+IOSchedulingClass=idle
+
+# Group-writable files so the SSH admin user (in the pireplace group) can manage them.
+UMask=0002
+# The only writable path is the music tree.
+ReadWritePaths=/srv/pireplace/music
+
+# The access token. /etc/pireplace/jellyfin.key is root:root 0600; systemd (as root)
+# hands this unit a private copy in $CREDENTIALS_DIRECTORY, which pireplace sync
+# prefers over api_key_file. The control page, Wi-Fi watcher and players cannot read it.
+LoadCredential=jellyfin.key:/etc/pireplace/jellyfin.key
+
+# Network: loopback (the rescan call to the control page) plus the Jellyfin server's
+# tailnet address, which Ansible adds in pireplace-sync.service.d/50-jellyfin-address.conf.
+# Nothing else is reachable, and only over lo and the Tailscale interface.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNetworkInterfaces=lo tailscale0
+
+# Hardening, as pireplace-control.service, plus no capabilities, no SysV IPC and the
+# common system-call set. AF_UNIX for logging.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateIPC=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

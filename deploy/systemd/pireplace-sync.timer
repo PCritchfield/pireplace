@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly pireplace music sync from Jellyfin
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Run at the next boot if the Pi was off at 04:30.
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,3 +108,98 @@ def load_config(path: Path) -> Config:
             value = path.resolve().parent.parent / value
         values[name] = value
     return Config(**values)
+
+
+DEFAULT_JELLYFIN_KEY_FILE = "/etc/pireplace/jellyfin.key"
+_HEX32 = re.compile(r"[0-9a-fA-F]{32}")
+_MOOD_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+@dataclass(frozen=True)
+class JellyfinConfig:
+    url: str  # no trailing slash
+    user_id: str
+    api_key_file: Path
+    playlists: dict[str, str]  # mood -> playlist Id, in file order
+
+
+def load_jellyfin_config(path: Path) -> JellyfinConfig | None:
+    """Read the optional [jellyfin] section of `path`; None if it is absent."""
+    path = Path(path)
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: invalid TOML: {e}") from e
+    except OSError as e:
+        raise ConfigError(f"{path}: cannot read: {e}") from e
+
+    if "jellyfin" not in data:
+        return None
+    table = data["jellyfin"]
+    if not isinstance(table, dict):
+        raise ConfigError("[jellyfin]: expected a table")
+
+    for key in ("url", "user_id"):
+        if key not in table:
+            raise ConfigError(f"jellyfin.{key}: required")
+    url = _coerce("jellyfin.url", table["url"], "str", None, None)
+    if not url.startswith(("http://", "https://")):
+        raise ConfigError(f"jellyfin.url: must start with http:// or https://, got {url!r}")
+    url = url.rstrip("/")
+
+    user_id = _coerce("jellyfin.user_id", table["user_id"], "str", None, None)
+    if not _HEX32.fullmatch(user_id):
+        raise ConfigError("jellyfin.user_id: expected 32 hex characters")
+
+    key_file = _coerce(
+        "jellyfin.api_key_file", table.get("api_key_file", DEFAULT_JELLYFIN_KEY_FILE),
+        "path", None, None,
+    )
+    if not key_file.is_absolute():
+        key_file = path.resolve().parent.parent / key_file
+
+    raw = table.get("playlists")
+    if not isinstance(raw, dict) or not raw:
+        raise ConfigError("jellyfin.playlists: expected a table with at least one playlist")
+    playlists = {}
+    for mood, pid in raw.items():
+        if not _MOOD_NAME.fullmatch(mood):
+            raise ConfigError(f"jellyfin.playlists: invalid mood name {mood!r}")
+        pid = _coerce(f"jellyfin.playlists.{mood}", pid, "str", None, None)
+        if not _HEX32.fullmatch(pid):
+            raise ConfigError(f"jellyfin.playlists.{mood}: expected 32 hex characters")
+        playlists[mood] = pid
+
+    return JellyfinConfig(url=url, user_id=user_id, api_key_file=key_file, playlists=playlists)
+
+
+CREDENTIAL_NAME = "jellyfin.key"
+
+
+def api_key_path(cfg: JellyfinConfig, environ: Mapping[str, str] | None = None) -> Path:
+    """Where the key is read from.
+
+    Under systemd (pireplace-sync.service: LoadCredential=jellyfin.key:...) the key is
+    $CREDENTIALS_DIRECTORY/jellyfin.key, readable only by this unit; the file in /etc is
+    root-only. Elsewhere (a hand run, tests) it is ``api_key_file``.
+    """
+    environ = os.environ if environ is None else environ
+    creds = environ.get("CREDENTIALS_DIRECTORY")
+    if creds:
+        candidate = Path(creds) / CREDENTIAL_NAME
+        if candidate.is_file():
+            return candidate
+    return cfg.api_key_file
+
+
+def read_api_key(cfg: JellyfinConfig, environ: Mapping[str, str] | None = None) -> str:
+    """Return the stripped key (see api_key_path). Never echoes the contents."""
+    path = api_key_path(cfg, environ)
+    try:
+        key = path.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        key = ""
+    if not key:
+        raise ConfigError(f"jellyfin: cannot read api_key_file {path}")
+    return key

@@ -24,6 +24,18 @@
           is the WPA2 password of the pireplace-setup hotspot and is never committed.
         quiet: true
 
+    - name: Refuse the CHANGE_ME placeholder for the Jellyfin and Tailscale settings
+      ansible.builtin.assert:
+        that:
+          - not (pireplace_jellyfin_api_key | default('', true) | string | trim).startswith('CHANGE_ME')
+          - not (pireplace_tailscale_authkey | default('', true) | string | trim).startswith('CHANGE_ME')
+          - not (pireplace_jellyfin_user_id | default('', true) | string | trim).startswith('CHANGE_ME')
+        fail_msg: >-
+          pireplace_jellyfin_api_key, pireplace_jellyfin_user_id or
+          pireplace_tailscale_authkey is still the CHANGE_ME placeholder from
+          inventory.example.ini: set the real value or remove the line.
+        quiet: true
+
 - name: Provision pireplace
   hosts: all
   become: true
@@ -59,6 +71,55 @@
     pireplace_system_units:
       - pireplace-control.service
       - pireplace-wifi.service
+    # Safety net for the NetworkManager profiles (oneshots: installed and enabled, never
+    # restarted by the system-units handler).
+    pireplace_netbackup_units:
+      - pireplace-netrestore.service
+      - pireplace-netbackup.service
+      - pireplace-netbackup.path
+    # Jellyfin music sync. Optional inventory vars: pireplace_jellyfin_api_key (turns it
+    # on), pireplace_jellyfin_url, pireplace_jellyfin_user_id, pireplace_jellyfin_playlists
+    # and pireplace_tailscale_authkey. Play vars outrank inventory vars, so the defaults
+    # live in the pireplace_jf_* names and an inventory override is read through them.
+    # The one test for "sync on": a token that is set, not null and not only whitespace.
+    pireplace_jf_enabled: "{{ (pireplace_jellyfin_api_key | default('', true) | string | trim | length) > 0 }}"
+    pireplace_jf_url: "{{ pireplace_jellyfin_url | default('http://100.88.8.6:8096') }}"
+    # The sync unit may only reach this address (IPAddressAllow drop-in), so the URL
+    # must name the server by its Tailscale IPv4 address.
+    pireplace_jf_host: "{{ pireplace_jf_url | urlsplit('hostname') }}"
+    # The non-admin Jellyfin user the sync reads as (music-streaming); the playlists
+    # are shared with it read-only.
+    pireplace_jf_user_id: "{{ pireplace_jellyfin_user_id | default('4640835a50a94bc69709d00d6f332fac') }}"
+    pireplace_jf_playlists: "{{ pireplace_jellyfin_playlists | default(pireplace_jf_default_playlists) }}"
+    pireplace_jf_default_playlists:
+      modern: dc8d8d54ecad68b2546b5c7c9b4b4766
+      classic-swing: f4b96696936ec335bfeca0c623ad0669
+      soul-motown: 79525d419fccb3bec7c38cef5fe07b11
+      instrumental: 30bf4d0f66600b1d1dd8cded00e25705
+    pireplace_sync_units:
+      - pireplace-sync.service
+      - pireplace-sync.timer
+    # Tailscale login. The auth key only passes through a root-only file on tmpfs
+    # (never argv), removed straight after `tailscale up`.
+    pireplace_ts_authkey_file: /run/pireplace-tailscale-authkey
+    pireplace_ts_have_key: "{{ (pireplace_tailscale_authkey | default('', true) | string | trim | length) > 0 }}"
+    pireplace_ts_up_hint: >-
+      sudo tailscale up --hostname=pireplace --accept-dns=false --shields-up
+      --advertise-tags=tag:pireplace
+    # What the owner must do, by tailscaled's BackendState (Running needs nothing).
+    pireplace_ts_notes:
+      NeedsLogin: >-
+        Tailscale is not logged in. On the Pi run `{{ pireplace_ts_up_hint }}` and open
+        the link it prints, or set pireplace_tailscale_authkey and deploy again.
+      NeedsMachineAuth: >-
+        Tailscale is logged in but the machine is waiting for approval: approve
+        "pireplace" in the Tailscale admin console (Machines), then deploy again.
+      Stopped: >-
+        Tailscale is logged in but stopped (tailscale down). Run `sudo tailscale up`
+        on the Pi.
+      other: >-
+        tailscaled reported state {{ pireplace_ts_backend_state }}. Check `sudo
+        systemctl status tailscaled` and `sudo tailscale status` on the Pi.
 
   tasks:
     - name: Require Python 3.11 or newer on the Pi
@@ -68,6 +129,17 @@
           - ansible_facts['python']['version_info'][1] >= 11
         fail_msg: pireplace needs Python 3.11+; use Raspberry Pi OS Bookworm or newer.
         quiet: true
+
+    - name: Require an IPv4 address in the Jellyfin URL (the sync unit may reach only it)
+      ansible.builtin.assert:
+        that:
+          - pireplace_jf_host is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+        fail_msg: >-
+          pireplace_jellyfin_url must name the Jellyfin server by its Tailscale IPv4
+          address (http://100.x.y.z:8096), not a host name: the sync service is only
+          allowed to connect to that address.
+        quiet: true
+      when: pireplace_jf_enabled
 
     # --- identity and packages -------------------------------------------------
 
@@ -89,6 +161,8 @@
           - pipewire-pulse
           - wireplumber
           - network-manager
+          # iw: counts hotspot clients (pireplace-wifi) and switches Wi-Fi power saving off.
+          - iw
           # polkit evaluates 50-pireplace.rules; dbus-user-session gives the lingering
           # pireplace user manager its session bus (PipeWire, systemctl --user --machine=).
           - polkitd
@@ -100,7 +174,7 @@
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Limit unattended-upgrades to security updates (Debian and Raspberry Pi)
+    - name: Limit unattended-upgrades to security updates (Debian, Raspberry Pi, Tailscale)
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/52pireplace-unattended-upgrades
         owner: root
@@ -108,12 +182,15 @@
         mode: "0644"
         content: |
           // Managed by Ansible. Replaces the default origin list: Debian security
-          // updates plus the Raspberry Pi archive (kernel/firmware fixes ship there).
+          // updates, the Raspberry Pi archive (kernel/firmware fixes ship there) and,
+          // when it is installed, Tailscale's repository (limited to Tailscale's own
+          // packages by /etc/apt/preferences.d/tailscale).
           #clear Unattended-Upgrade::Origins-Pattern;
           Unattended-Upgrade::Origins-Pattern {
               "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
               "origin=Debian,codename=${distro_codename},label=Debian-Security";
               "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
+              "origin=Tailscale,codename=${distro_codename},label=Tailscale";
           };
 
     - name: Enable the daily unattended-upgrades run
@@ -125,6 +202,139 @@
         content: |
           APT::Periodic::Update-Package-Lists "1";
           APT::Periodic::Unattended-Upgrade "1";
+
+    # --- Tailscale (the Jellyfin server is reached over the tailnet) ------------
+    # Only with the Jellyfin sync on. Matches a hand install with the official script
+    # (same keyring and source file), so on such a Pi every task here reports ok.
+
+    - name: Tailscale (only with the Jellyfin sync on)
+      when: pireplace_jf_enabled
+      block:
+        - name: Look for the Tailscale signing key
+          ansible.builtin.stat:
+            path: /usr/share/keyrings/tailscale-archive-keyring.gpg
+          register: pireplace_ts_keyring
+
+        - name: Fetch the Tailscale signing key (only when absent; the package keeps it afterwards)
+          ansible.builtin.get_url:
+            url: "https://pkgs.tailscale.com/stable/debian/{{ ansible_distribution_release }}.noarmor.gpg"
+            dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+            owner: root
+            group: root
+            mode: "0644"
+          when: not pireplace_ts_keyring.stat.exists
+          register: pireplace_ts_key
+
+        # lineinfile (not copy): the official script's file may carry a comment header.
+        - name: Add the Tailscale apt source
+          ansible.builtin.lineinfile:
+            path: /etc/apt/sources.list.d/tailscale.list
+            regexp: '^deb .*pkgs\.tailscale\.com'
+            line: "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian {{ ansible_distribution_release }} main"
+            create: true
+            owner: root
+            group: root
+            mode: "0644"
+          register: pireplace_ts_source
+
+        # unattended-upgrades follows this origin; only Tailscale's packages may come from it.
+        - name: Pin the Tailscale repository to Tailscale's own packages
+          ansible.builtin.copy:
+            dest: /etc/apt/preferences.d/tailscale
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              # Managed by Ansible. pkgs.tailscale.com may only supply Tailscale's packages.
+              Package: tailscale*
+              Pin: origin pkgs.tailscale.com
+              Pin-Priority: 500
+
+              Package: *
+              Pin: origin pkgs.tailscale.com
+              Pin-Priority: -1
+
+        - name: Refresh apt after adding the Tailscale repository
+          ansible.builtin.apt:
+            update_cache: true
+          when: pireplace_ts_source is changed or pireplace_ts_key is changed
+
+        - name: Install Tailscale
+          ansible.builtin.apt:
+            name:
+              - tailscale
+              - tailscale-archive-keyring
+            state: present
+
+        - name: Enable and start tailscaled
+          ansible.builtin.systemd_service:
+            name: tailscaled.service
+            enabled: true
+            state: started
+
+        - name: Query the Tailscale login state
+          ansible.builtin.command: tailscale status --json
+          register: pireplace_ts_status
+          changed_when: false
+          failed_when: false
+
+        - name: Read the Tailscale login state (BackendState)
+          ansible.builtin.set_fact:
+            pireplace_ts_backend_state: >-
+              {{ (pireplace_ts_status.stdout | from_json).BackendState | default('Unknown')
+                 if (pireplace_ts_status.stdout | default('', true) | trim).startswith('{')
+                 else 'Unknown' }}
+
+        # Only a node that needs a login: a logged-in node (Running, Stopped, waiting for
+        # approval) is never re-authenticated. --auth-key=file: keeps the key off argv;
+        # --shields-up because nothing on the tailnet needs to connect to the Pi.
+        - name: Join the tailnet (only when it needs a login and an auth key was given)
+          when:
+            - pireplace_ts_backend_state == 'NeedsLogin'
+            - pireplace_ts_have_key
+          block:
+            - name: Write the Tailscale auth key to a root-only file
+              ansible.builtin.copy:
+                dest: "{{ pireplace_ts_authkey_file }}"
+                content: "{{ pireplace_tailscale_authkey | string | trim }}"
+                owner: root
+                group: root
+                mode: "0600"
+              no_log: true
+
+            - name: Run tailscale up with the auth key
+              ansible.builtin.command:
+                argv:
+                  - tailscale
+                  - up
+                  - --hostname=pireplace
+                  - --accept-dns=false
+                  - --shields-up
+                  - --advertise-tags=tag:pireplace
+                  - --timeout=60s
+                  - "--auth-key=file:{{ pireplace_ts_authkey_file }}"
+              changed_when: true
+              no_log: true
+          rescue:
+            - name: Explain the failed Tailscale login
+              ansible.builtin.fail:
+                msg: >-
+                  tailscale up failed: auth key rejected (expired, already used, or not
+                  allowed to apply tag:pireplace) or no connection within 60 s. Re-authenticate
+                  by hand: on the Pi run `{{ pireplace_ts_up_hint }}`, open the link, then
+                  deploy again.
+          always:
+            - name: Remove the Tailscale auth key file
+              ansible.builtin.file:
+                path: "{{ pireplace_ts_authkey_file }}"
+                state: absent
+
+        - name: Tell the owner what Tailscale needs
+          ansible.builtin.debug:
+            msg: "{{ pireplace_ts_notes[pireplace_ts_backend_state] | default(pireplace_ts_notes['other']) }}"
+          when:
+            - pireplace_ts_backend_state != 'Running'
+            - not (pireplace_ts_backend_state == 'NeedsLogin' and pireplace_ts_have_key)
 
     # --- service user ----------------------------------------------------------
 
@@ -214,6 +424,24 @@
       no_log: true
       notify: Restart pireplace system services
 
+    # Root-only: pireplace-sync.service gets a copy through LoadCredential. The token is
+    # never in config.toml.
+    - name: Install the Jellyfin access token file
+      ansible.builtin.copy:
+        dest: /etc/pireplace/jellyfin.key
+        content: "{{ pireplace_jellyfin_api_key | string | trim }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when: pireplace_jf_enabled
+      no_log: true
+
+    - name: Remove the Jellyfin access token file (no key configured)
+      ansible.builtin.file:
+        path: /etc/pireplace/jellyfin.key
+        state: absent
+      when: not pireplace_jf_enabled
+
     - name: Create media directories
       ansible.builtin.file:
         path: "{{ item }}"
@@ -221,7 +449,7 @@
         owner: "{{ pireplace_user }}"
         group: "{{ pireplace_user }}"
         mode: "2775"
-      loop: "{{ ['/srv/pireplace', '/srv/pireplace/videos', '/srv/pireplace/music'] + (pireplace_moods | map('regex_replace', '^', '/srv/pireplace/music/') | list) }}"
+      loop: "{{ ['/srv/pireplace', '/srv/pireplace/videos', '/srv/pireplace/music'] + ((pireplace_jf_playlists.keys() | list if pireplace_jf_enabled else pireplace_moods) | map('regex_replace', '^', '/srv/pireplace/music/') | list) }}"
 
     # --- systemd, tmpfiles, polkit --------------------------------------------
 
@@ -242,6 +470,17 @@
         group: root
         mode: "0644"
 
+    # No NetworkManager restart here: the playbook usually runs over Wi-Fi and a restart
+    # would drop the SSH session. The handler reloads the conf and applies it to wlan0 now.
+    - name: Turn Wi-Fi power saving off for NetworkManager connections
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../networkmanager/pireplace-wifi-powersave.conf"
+        dest: /etc/NetworkManager/conf.d/pireplace-wifi-powersave.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Apply Wi-Fi power saving
+
     - name: Install system units
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../systemd/{{ item }}"
@@ -253,6 +492,80 @@
       notify:
         - Reload systemd
         - Restart pireplace system services
+
+    - name: Install the NetworkManager profile backup and restore units
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../systemd/{{ item }}"
+        dest: /etc/systemd/system/{{ item }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pireplace_netbackup_units }}"
+      notify: Reload systemd
+
+    - name: Install the Jellyfin sync units (service and timer)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../systemd/{{ item }}"
+        dest: /etc/systemd/system/{{ item }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pireplace_sync_units }}"
+      when: pireplace_jf_enabled
+      notify: Reload systemd
+
+    - name: Create the sync unit drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/pireplace-sync.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: pireplace_jf_enabled
+
+    - name: Allow the sync service to reach the Jellyfin server (and nothing else off the Pi)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pireplace-sync.service.d/50-jellyfin-address.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible: the host of pireplace_jellyfin_url. The unit itself denies
+          # every address but loopback.
+          [Service]
+          IPAddressAllow={{ pireplace_jf_host }}/32
+      when: pireplace_jf_enabled
+      notify: Reload systemd
+
+    - name: Remove the sync unit drop-ins (no key configured)
+      ansible.builtin.file:
+        path: /etc/systemd/system/pireplace-sync.service.d
+        state: absent
+      when: not pireplace_jf_enabled
+      notify: Reload systemd
+
+    - name: Look for installed Jellyfin sync units
+      ansible.builtin.stat:
+        path: /etc/systemd/system/pireplace-sync.timer
+      register: pireplace_sync_timer_unit
+      when: not pireplace_jf_enabled
+
+    - name: Disable and stop the Jellyfin sync timer (no key configured)
+      ansible.builtin.systemd_service:
+        name: pireplace-sync.timer
+        enabled: false
+        state: stopped
+      when:
+        - not pireplace_jf_enabled
+        - pireplace_sync_timer_unit.stat.exists
+
+    - name: Remove the Jellyfin sync units (no key configured)
+      ansible.builtin.file:
+        path: /etc/systemd/system/{{ item }}
+        state: absent
+      loop: "{{ pireplace_sync_units }}"
+      when: not pireplace_jf_enabled
+      notify: Reload systemd
 
     - name: Install user units (run by the pireplace user manager)
       ansible.builtin.copy:
@@ -346,12 +659,101 @@
         - NetworkManager.service
         - avahi-daemon.service
 
+    # Profiles must live as NetworkManager keyfiles. NM once wrote netplan YAML in place
+    # (/etc/netplan/90-NM-*.yaml) and left the files empty, which cost the Pi all networking.
+    # -e no keeps ':' in values unescaped; the UUID has none, so split at the first ':'.
+    - name: List the NetworkManager profiles and where they are stored
+      ansible.builtin.command:
+        argv: [nmcli, -g, "UUID,FILENAME", -e, "no", connection, show]
+      register: pireplace_nm_profiles
+      changed_when: false
+      check_mode: false
+
+    # Report only: migrating a possibly active profile over the Wi-Fi SSH session is untested
+    # and could drop access. Do it by hand from a console if this ever lists anything.
+    - name: Report profiles still stored as netplan YAML (never migrated automatically)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: NetworkManager profiles stored as netplan YAML (UUID:FILE):
+          {{ pireplace_netplan_profiles | join(', ') }}. netplan storage can leave profiles
+          empty. From a console (not over Wi-Fi SSH) run, for each UUID:
+          sudo nmcli connection migrate --plugin keyfile UUID
+      vars:
+        pireplace_netplan_profiles: >-
+          {{ pireplace_nm_profiles.stdout_lines
+             | select('match', '^[^:]*:(/etc/netplan/|/run/NetworkManager/system-connections/netplan-)')
+             | list }}
+      when: pireplace_netplan_profiles | length > 0
+
+    - name: Enable the NetworkManager profile backup, restore and watcher
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+      loop: "{{ pireplace_netbackup_units }}"
+
+    - name: Start the profile watcher
+      ansible.builtin.systemd_service:
+        name: pireplace-netbackup.path
+        state: started
+
     - name: Enable and start the control page and Wi-Fi watcher
       ansible.builtin.systemd_service:
         name: "{{ item }}"
         enabled: true
         state: started
       loop: "{{ pireplace_system_units }}"
+
+    # Best effort: a failing first backup must not fail the deploy (the unit retries on
+    # every profile change and every boot).
+    - name: Back up the NetworkManager profiles once now
+      ansible.builtin.command:
+        argv: [systemctl, start, pireplace-netbackup.service]
+      register: pireplace_netbackup_first
+      changed_when: false
+      failed_when: false
+
+    - name: Warn when the first profile backup failed
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the first NetworkManager profile backup failed (exit
+          {{ pireplace_netbackup_first.rc }}). See `journalctl -u pireplace-netbackup`.
+      when: pireplace_netbackup_first.rc | default(0) != 0
+
+    - name: Enable and start the Jellyfin sync timer
+      ansible.builtin.systemd_service:
+        name: pireplace-sync.timer
+        enabled: true
+        state: started
+      when: pireplace_jf_enabled
+
+    # --- persistent journal ----------------------------------------------------
+
+    # Raspberry Pi OS ships 40-rpi-volatile-storage.conf (Storage=volatile); 90- sorts after it.
+    - name: Create the journald drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Keep the journal across reboots, capped for the SD card
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../journald/90-pireplace-persistent.conf"
+        dest: /etc/systemd/journald.conf.d/90-pireplace-persistent.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart journald
+
+    - name: Make sure the persistent journal directory exists
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
+        owner: root
+        group: systemd-journal
+        mode: "2755"
+      notify: Restart journald
 
     # --- quiet TV --------------------------------------------------------------
 
@@ -394,13 +796,26 @@
 
     # Imager's first-boot settings (user, Wi-Fi via netplan, hostname) are already
     # applied and persist without cloud-init. To undo: delete this file.
-    - name: Ensure /etc/cloud exists
+    - name: Ensure /etc/cloud and /etc/cloud/cloud.cfg.d exist
       ansible.builtin.file:
-        path: /etc/cloud
+        path: "{{ item }}"
         state: directory
         owner: root
         group: root
         mode: "0755"
+      loop:
+        - /etc/cloud
+        - /etc/cloud/cloud.cfg.d
+
+    # Never let cloud-init (Raspberry Pi Imager's /boot/firmware/network-config) render
+    # netplan network config again.
+    - name: Install the cloud-init drop-in that disables network config
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../cloud-init/99-pireplace-no-network.cfg"
+        dest: /etc/cloud/cloud.cfg.d/99-pireplace-no-network.cfg
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Disable cloud-init so its per-boot stages stay off the TV
       ansible.builtin.file:
@@ -446,8 +861,28 @@
       ansible.builtin.systemd_service:
         daemon_reload: true
 
+    - name: Restart journald
+      ansible.builtin.systemd_service:
+        name: systemd-journald.service
+        state: restarted
+
+    - name: Move the volatile journal to disk
+      ansible.builtin.command:
+        argv: [journalctl, --flush]
+      listen: Restart journald
+      changed_when: true
+
     - name: Apply tmpfiles
       ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/pireplace.conf
+      changed_when: true
+
+    - name: Apply Wi-Fi power saving
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          nmcli general reload conf
+          iw dev wlan0 set power_save off || true
+        executable: /bin/bash
       changed_when: true
 
     - name: Restart pireplace system services

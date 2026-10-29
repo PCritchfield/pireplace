@@ -47,6 +47,10 @@ RestrictRealtime=yes
 SystemCallArchitectures=native
 UMask=0077
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Not on the tailnet: refuse Tailscale's CGNAT (IPv4) and ULA (IPv6) ranges, so other
+# tailnet devices cannot drive the page. The home LAN and the hotspot (10.42.0.0/24)
+# are unaffected.
+IPAddressDeny=100.64.0.0/10 fd7a:115c:a1e0::/48
 
 [Install]
 WantedBy=multi-user.target
