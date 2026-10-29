@@ -1,6 +1,8 @@
 [Unit]
 Description=pireplace: back up good NetworkManager profiles
 After=NetworkManager.service pireplace-netrestore.service
+# A burst of PathChanged triggers must never trip the start limit and stop the watcher.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

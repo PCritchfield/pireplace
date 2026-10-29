@@ -857,19 +857,31 @@ def test_powersave_handler_reloads_conf_and_tolerates_a_missing_wlan0():
     assert cmds[1].startswith("iw dev wlan0 set power_save off") and cmds[1].endswith("|| true")
 
 
-def test_netplan_migration_filter_matches_only_netplan_backed_profiles():
-    task = next(t for t in _tasks() if "Move any profile stored as netplan" in t["name"])
-    cond = " ".join(task["when"].split())
-    prefixes = re.findall(r"startswith\('([^']+)'\)", cond)
-    assert prefixes == ["/etc/netplan/", "/run/NetworkManager/system-connections/netplan-"]
-    for filename, migrate in (
-        ("/etc/netplan/90-NM-x.yaml", True),
-        ("/run/NetworkManager/system-connections/netplan-NM-x.nmconnection", True),
-        ("/run/NetworkManager/system-connections/lo.nmconnection", False),
-        ("/run/NetworkManager/system-connections/tailscale0.nmconnection", False),
-        ("/etc/NetworkManager/system-connections/home.nmconnection", False),
+def test_netplan_profiles_are_reported_never_migrated_automatically():
+    task = next(t for t in _tasks() if "Report profiles still stored as netplan" in t["name"])
+    assert "ansible.builtin.debug" in task and "nmcli connection migrate --plugin keyfile" in task["ansible.builtin.debug"]["msg"]
+    assert "console" in task["ansible.builtin.debug"]["msg"]
+    for t in _tasks():  # nothing runs a migrate
+        assert "migrate" not in str(t.get("ansible.builtin.command", "")) + str(t.get("ansible.builtin.shell", ""))
+    pattern = re.search(r"select\('match', '([^']+)'\)", str(task["vars"]["pireplace_netplan_profiles"])).group(1)
+    for line, listed in (
+        ("u1:/etc/netplan/90-NM-x.yaml", True),
+        ("u2:/run/NetworkManager/system-connections/netplan-NM-x.nmconnection", True),
+        ("u3:/run/NetworkManager/system-connections/lo.nmconnection", False),
+        ("u4:/run/NetworkManager/system-connections/tailscale0.nmconnection", False),
+        ("u5:/etc/NetworkManager/system-connections/home.nmconnection", False),
     ):
-        assert filename.startswith(tuple(prefixes)) is migrate
+        assert bool(re.match(pattern, line)) is listed
+    assert "is defined" not in task["when"] and "length > 0" in task["when"]
+
+
+def test_first_backup_warning_survives_check_mode():
+    task = next(t for t in _tasks() if "Warn when the first profile backup failed" in t["name"])
+    assert "default(0)" in task["when"]
+
+
+def test_netbackup_service_cannot_trip_the_start_limit():
+    assert unit("pireplace-netbackup.service")["Unit"]["StartLimitIntervalSec"] == ["0"]
 
 
 def test_first_profile_backup_cannot_fail_the_play_and_runs_after_the_services():

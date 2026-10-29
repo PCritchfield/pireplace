@@ -669,16 +669,21 @@
       changed_when: false
       check_mode: false
 
-    - name: Move any profile stored as netplan YAML into a keyfile (other profiles under /run, lo and tailscale0, are left alone)
-      ansible.builtin.command:
-        argv: [nmcli, connection, migrate, --plugin, keyfile, "{{ item.partition(':')[0] }}"]
-      loop: "{{ pireplace_nm_profiles.stdout_lines }}"
-      loop_control:
-        label: "{{ item.partition(':')[0] }}"
-      when: >-
-        item.partition(':')[2].startswith('/etc/netplan/')
-        or item.partition(':')[2].startswith('/run/NetworkManager/system-connections/netplan-')
-      changed_when: true
+    # Report only: migrating a possibly active profile over the Wi-Fi SSH session is untested
+    # and could drop access. Do it by hand from a console if this ever lists anything.
+    - name: Report profiles still stored as netplan YAML (never migrated automatically)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: NetworkManager profiles stored as netplan YAML (UUID:FILE):
+          {{ pireplace_netplan_profiles | join(', ') }}. netplan storage can leave profiles
+          empty. From a console (not over Wi-Fi SSH) run, for each UUID:
+          sudo nmcli connection migrate --plugin keyfile UUID
+      vars:
+        pireplace_netplan_profiles: >-
+          {{ pireplace_nm_profiles.stdout_lines
+             | select('match', '^[^:]*:(/etc/netplan/|/run/NetworkManager/system-connections/netplan-)')
+             | list }}
+      when: pireplace_netplan_profiles | length > 0
 
     - name: Enable the NetworkManager profile backup, restore and watcher
       ansible.builtin.systemd_service:
@@ -712,7 +717,7 @@
         msg: >-
           WARNING: the first NetworkManager profile backup failed (exit
           {{ pireplace_netbackup_first.rc }}). See `journalctl -u pireplace-netbackup`.
-      when: pireplace_netbackup_first.rc != 0
+      when: pireplace_netbackup_first.rc | default(0) != 0
 
     - name: Enable and start the Jellyfin sync timer
       ansible.builtin.systemd_service:

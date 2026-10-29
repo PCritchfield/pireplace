@@ -264,8 +264,9 @@ your Wi-Fi can change the Pi's network.
 NetworkManager once stored two profiles as netplan YAML and left them empty, which cost
 the Pi all networking. The deploy now guards against that:
 
-- Profiles are NetworkManager keyfiles only. Any profile found under `/etc/netplan/` is
-  migrated to a keyfile, and a cloud-init drop-in stops cloud-init (the Raspberry Pi
+- Profiles are NetworkManager keyfiles only. The deploy reports (but never
+  migrates) any profile still stored as netplan YAML, with the manual
+  `nmcli connection migrate --plugin keyfile UUID` to run from a console, and a cloud-init drop-in stops cloud-init (the Raspberry Pi
   Imager `network-config`) from rendering network config again.
 - Good profiles are copied to `/var/lib/pireplace-netbackup` (root only, mode 0700)
   whenever `/etc/NetworkManager/system-connections` changes and once per boot
@@ -281,9 +282,11 @@ the Pi all networking. The deploy now guards against that:
       journalctl -b -1 -u pireplace-wifi
       journalctl -k -b -1 | grep -i voltage
 
-The backup is never overwritten by a truncated copy (the previous version is kept as
-`.prev`), and a live file the restore cannot read or understand is left alone; a bad file
-it replaces is kept in the backup directory as `NAME.corrupt-<time>`.
+A complete live profile replaces its backup (the previous version is kept as `.prev`); a
+truncated or incomplete one never does, nor does a WPA profile that lost its `psk` (a
+warning names the `netbackup-forget` fix). A live file the restore cannot read or
+understand is left alone; a bad file it replaces is kept in the backup directory as
+`NAME.corrupt-<time>` (the newest 5 per profile).
 
 To forget the only saved Wi-Fi network for good (the backup deliberately survives
 deleting the last Wi-Fi profile, so a mistake cannot leave the Pi offline), run:
