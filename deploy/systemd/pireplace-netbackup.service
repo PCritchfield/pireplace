@@ -1,13 +1,17 @@
 [Unit]
 Description=pireplace: back up good NetworkManager profiles
-After=NetworkManager.service
+After=NetworkManager.service pireplace-netrestore.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=60s
 Environment=PYTHONPATH=/opt/pireplace
 Environment=PYTHONDONTWRITEBYTECODE=1
+# Let a PathChanged trigger on NM's temp file settle, so the final file is read.
+ExecStartPre=/bin/sleep 2
 ExecStart=/usr/bin/python3 -m pireplace netbackup-sync
-ReadWritePaths=/etc/NetworkManager/system-connections /var/lib/pireplace-netbackup
+ReadOnlyPaths=-/etc/NetworkManager/system-connections
+ReadWritePaths=/var/lib/pireplace-netbackup
 StateDirectory=pireplace-netbackup
 StateDirectoryMode=0700
 

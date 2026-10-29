@@ -70,8 +70,13 @@ def test_netbackup_oneshots_are_hardened_and_offline(name):
     assert service["ProtectSystem"] == ["strict"]
     assert service["PrivateNetwork"] == ["yes"]
     assert service["CapabilityBoundingSet"] == [""]
-    assert set(service["ReadWritePaths"][0].split()) == {
-        "/etc/NetworkManager/system-connections", "/var/lib/pireplace-netbackup"}
+    assert service["TimeoutStartSec"] == ["30s" if "restore" in name else "60s"]
+    writable = set(service["ReadWritePaths"][0].split())
+    if "restore" in name:  # rewrites NM's directory; '-' so a missing dir cannot fail the sandbox
+        assert writable == {"-/etc/NetworkManager/system-connections", "/var/lib/pireplace-netbackup"}
+    else:  # only reads NM's directory
+        assert writable == {"/var/lib/pireplace-netbackup"}
+        assert service["ReadOnlyPaths"] == ["-/etc/NetworkManager/system-connections"]
     assert service["StateDirectoryMode"] == ["0700"]
     assert "Restart" not in service  # a oneshot must not loop
 
@@ -90,7 +95,8 @@ def test_netrestore_runs_before_networkmanager_which_never_requires_it():
 
 def test_netbackup_runs_after_networkmanager_on_changes_and_once_per_boot():
     service = unit("pireplace-netbackup.service")
-    assert service["Unit"]["After"] == ["NetworkManager.service"]
+    assert service["Unit"]["After"] == ["NetworkManager.service pireplace-netrestore.service"]
+    assert service["Service"]["ExecStartPre"] == ["/bin/sleep 2"]
     assert service["Install"]["WantedBy"] == ["multi-user.target"]
     path = unit("pireplace-netbackup.path")
     assert path["Path"]["PathChanged"] == ["/etc/NetworkManager/system-connections"]
@@ -125,6 +131,7 @@ def test_playbook_installs_the_safety_net_files():
     ):
         assert (ROOT / "deploy" / src).is_file() and src in SITE and dest in SITE
     assert "nmcli" in SITE and "migrate" in SITE and "/etc/netplan/" in SITE
+    assert "/run/NetworkManager/system-connections/netplan-" in SITE
     play = yaml.safe_load(SITE)[1]
     assert "pireplace-netbackup" not in " ".join(play["vars"]["pireplace_system_units"])
 
@@ -848,3 +855,26 @@ def test_powersave_handler_reloads_conf_and_tolerates_a_missing_wlan0():
     assert cmds.pop(0) == "set -e"  # a failed reload must fail the play; only the iw step is optional
     assert cmds[0] == "nmcli general reload conf"
     assert cmds[1].startswith("iw dev wlan0 set power_save off") and cmds[1].endswith("|| true")
+
+
+def test_netplan_migration_filter_matches_only_netplan_backed_profiles():
+    task = next(t for t in _tasks() if "Move any profile stored as netplan" in t["name"])
+    cond = " ".join(task["when"].split())
+    prefixes = re.findall(r"startswith\('([^']+)'\)", cond)
+    assert prefixes == ["/etc/netplan/", "/run/NetworkManager/system-connections/netplan-"]
+    for filename, migrate in (
+        ("/etc/netplan/90-NM-x.yaml", True),
+        ("/run/NetworkManager/system-connections/netplan-NM-x.nmconnection", True),
+        ("/run/NetworkManager/system-connections/lo.nmconnection", False),
+        ("/run/NetworkManager/system-connections/tailscale0.nmconnection", False),
+        ("/etc/NetworkManager/system-connections/home.nmconnection", False),
+    ):
+        assert filename.startswith(tuple(prefixes)) is migrate
+
+
+def test_first_profile_backup_cannot_fail_the_play_and_runs_after_the_services():
+    tasks = _tasks()
+    names = [t["name"] for t in tasks]
+    first = names.index("Back up the NetworkManager profiles once now")
+    assert first > names.index("Enable and start the control page and Wi-Fi watcher")
+    assert tasks[first]["failed_when"] is False and "register" in tasks[first]

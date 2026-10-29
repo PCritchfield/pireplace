@@ -8,11 +8,12 @@ Before=NetworkManager.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=30s
 Environment=PYTHONPATH=/opt/pireplace
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 -m pireplace netbackup-restore
 # Root rewrites its own files; nothing else is writable.
-ReadWritePaths=/etc/NetworkManager/system-connections /var/lib/pireplace-netbackup
+ReadWritePaths=-/etc/NetworkManager/system-connections /var/lib/pireplace-netbackup
 StateDirectory=pireplace-netbackup
 StateDirectoryMode=0700
 

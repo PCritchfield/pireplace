@@ -281,6 +281,17 @@ the Pi all networking. The deploy now guards against that:
       journalctl -b -1 -u pireplace-wifi
       journalctl -k -b -1 | grep -i voltage
 
+The backup is never overwritten by a truncated copy (the previous version is kept as
+`.prev`), and a live file the restore cannot read or understand is left alone; a bad file
+it replaces is kept in the backup directory as `NAME.corrupt-<time>`.
+
+To forget the only saved Wi-Fi network for good (the backup deliberately survives
+deleting the last Wi-Fi profile, so a mistake cannot leave the Pi offline), run:
+
+    sudo python3 -m pireplace netbackup-forget NAME.nmconnection
+
+with `PYTHONPATH=/opt/pireplace`.
+
 The backup holds Wi-Fi passwords; nothing here logs them.
 
 ## Laptop development

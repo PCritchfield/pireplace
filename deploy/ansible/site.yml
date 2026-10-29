@@ -669,13 +669,15 @@
       changed_when: false
       check_mode: false
 
-    - name: Move any profile stored as netplan YAML into a keyfile (profiles under /run are left alone)
+    - name: Move any profile stored as netplan YAML into a keyfile (other profiles under /run, lo and tailscale0, are left alone)
       ansible.builtin.command:
         argv: [nmcli, connection, migrate, --plugin, keyfile, "{{ item.partition(':')[0] }}"]
       loop: "{{ pireplace_nm_profiles.stdout_lines }}"
       loop_control:
         label: "{{ item.partition(':')[0] }}"
-      when: item.partition(':')[2].startswith('/etc/netplan/')
+      when: >-
+        item.partition(':')[2].startswith('/etc/netplan/')
+        or item.partition(':')[2].startswith('/run/NetworkManager/system-connections/netplan-')
       changed_when: true
 
     - name: Enable the NetworkManager profile backup, restore and watcher
@@ -689,17 +691,28 @@
         name: pireplace-netbackup.path
         state: started
 
-    - name: Back up the NetworkManager profiles once now
-      ansible.builtin.command:
-        argv: [systemctl, start, pireplace-netbackup.service]
-      changed_when: false
-
     - name: Enable and start the control page and Wi-Fi watcher
       ansible.builtin.systemd_service:
         name: "{{ item }}"
         enabled: true
         state: started
       loop: "{{ pireplace_system_units }}"
+
+    # Best effort: a failing first backup must not fail the deploy (the unit retries on
+    # every profile change and every boot).
+    - name: Back up the NetworkManager profiles once now
+      ansible.builtin.command:
+        argv: [systemctl, start, pireplace-netbackup.service]
+      register: pireplace_netbackup_first
+      changed_when: false
+      failed_when: false
+
+    - name: Warn when the first profile backup failed
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the first NetworkManager profile backup failed (exit
+          {{ pireplace_netbackup_first.rc }}). See `journalctl -u pireplace-netbackup`.
+      when: pireplace_netbackup_first.rc != 0
 
     - name: Enable and start the Jellyfin sync timer
       ansible.builtin.systemd_service:
