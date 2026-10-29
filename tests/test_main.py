@@ -118,3 +118,87 @@ def test_serve_gives_players_a_timeout_that_survives_opening_a_large_file(tmp_pa
     p.write_text("")
     assert main(["serve", "--config", str(p)]) == 1
     assert len(clients) == 2 and all(c.timeout == 3.0 for c in clients)
+
+
+# --- sync subcommand -----------------------------------------------------------
+
+import logging
+
+from tests.fake_jellyfin import FakeJellyfin
+from tests.test_sync import rescan_server  # noqa: F401  (fixture)
+
+PL_ID = "a" * 32
+USER_ID = "b" * 32
+
+
+def _write_cfg(tmp_path, url="http://127.0.0.1:1", key="k" * 20, port=80, jellyfin=True):
+    key_file = tmp_path / "jf.key"
+    if key is not None:
+        key_file.write_text(key + "\n")
+    text = f'[media]\nmusic_dir = "{tmp_path / "music"}"\n[web]\nport = {port}\n'
+    if jellyfin:
+        text += (
+            f'[jellyfin]\nurl = "{url}"\nuser_id = "{USER_ID}"\napi_key_file = "{key_file}"\n'
+            f'[jellyfin.playlists]\nmodern = "{PL_ID}"\n'
+        )
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(text)
+    return cfg
+
+
+@pytest.fixture
+def fake():
+    with FakeJellyfin() as f:
+        yield f
+
+
+@pytest.fixture
+def plenty_of_space(monkeypatch):
+    monkeypatch.setattr("pireplace.sync.default_free_bytes", lambda p: 10 * 1024**4)
+
+
+def test_sync_cli_no_jellyfin_section_exits_2(tmp_path, capsys):
+    cfg = _write_cfg(tmp_path, jellyfin=False)
+    assert main(["sync", "--config", str(cfg)]) == 2
+    err = capsys.readouterr().err
+    assert f"no [jellyfin] section in {cfg}" in err and len(err.strip().splitlines()) == 1
+
+
+def test_sync_cli_bad_config_exits_2(tmp_path, capsys):
+    assert main(["sync", "--config", str(tmp_path / "nope.toml")]) == 2
+    assert "nope.toml" in capsys.readouterr().err
+
+
+def test_sync_cli_missing_key_exits_2_without_leaking(tmp_path, capsys):
+    cfg = _write_cfg(tmp_path, key=None)
+    assert main(["sync", "--config", str(cfg)]) == 2
+    err = capsys.readouterr().err
+    assert "jf.key" in err and len(err.strip().splitlines()) == 1
+
+
+def _item(i, title):
+    return {
+        "Id": i, "AlbumArtist": "Art", "Name": title, "Container": "flac",
+        "MediaSources": [{"Container": "flac", "Size": 5}],
+    }
+
+
+def test_sync_cli_end_to_end_with_fake_jellyfin(tmp_path, fake, plenty_of_space, rescan_server):
+    port, seen = rescan_server  # answers GET /api/status with music not playing
+    fake.playlists[PL_ID] = [_item("c" * 32, "One")]
+    fake.files["c" * 32] = b"audio"
+    cfg = _write_cfg(tmp_path, url=fake.url, key=fake.key, port=port)
+    assert main(["sync", "--config", str(cfg)]) == 0
+    assert any((tmp_path / "music" / "modern").glob("*.flac"))
+    assert [s[0] for s in seen] == ["/api/status", "/api/rescan"]
+
+
+def test_api_key_never_logged(tmp_path, fake, plenty_of_space, caplog, capsys):
+    fake.playlists[PL_ID] = [_item("c" * 32, "One")]
+    wrong = "wrong-key-SECRET-9876"
+    cfg = _write_cfg(tmp_path, url=fake.url, key=wrong)
+    with caplog.at_level(logging.DEBUG):
+        assert main(["sync", "--config", str(cfg)]) == 1
+    out = capsys.readouterr()
+    assert wrong not in caplog.text and wrong not in out.err and wrong not in out.out
+    assert "mood=modern" in caplog.text

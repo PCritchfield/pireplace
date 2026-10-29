@@ -30,3 +30,17 @@ hotspot_after_s = 300
 hotspot_retry_s = 300
 # The setup page only answers requests made to this address (NetworkManager's hotspot).
 hotspot_address = {{ pireplace_hotspot_address | to_json }}
+{% if pireplace_jf_enabled | bool %}
+
+# Nightly music sync (pireplace sync). The access token lives in api_key_file only;
+# under systemd the sync reads its LoadCredential copy ($CREDENTIALS_DIRECTORY/jellyfin.key).
+[jellyfin]
+url = {{ pireplace_jf_url | to_json }}
+user_id = {{ pireplace_jf_user_id | to_json }}
+api_key_file = "/etc/pireplace/jellyfin.key"
+
+[jellyfin.playlists]
+{% for mood, playlist_id in pireplace_jf_playlists.items() %}
+{{ mood | to_json }} = {{ playlist_id | to_json }}
+{% endfor %}
+{% endif %}

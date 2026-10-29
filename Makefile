@@ -18,7 +18,7 @@ INVENTORY ?=
 HOST ?=
 ANSIBLE_ARGS ?=
 BIN := $(if $(wildcard .venv/bin/ansible-playbook),.venv/bin/,)
-UNITS_SYSTEM := deploy/systemd/pireplace-control.service deploy/systemd/pireplace-wifi.service
+UNITS_SYSTEM := deploy/systemd/pireplace-control.service deploy/systemd/pireplace-wifi.service deploy/systemd/pireplace-sync.service deploy/systemd/pireplace-sync.timer
 UNITS_USER := deploy/systemd/pireplace-video.service deploy/systemd/pireplace-music.service
 
 .PHONY: lint
