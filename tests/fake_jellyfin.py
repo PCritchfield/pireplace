@@ -21,6 +21,9 @@ class FakeJellyfin:
         self.truncate: set[str] = set()  # item Ids: send half the bytes, full Content-Length
         self.html: set[str] = set()  # paths (no query) answering 200 with an HTML page
         self.trickle: dict[str, float] = {}  # item Id -> seconds between 4-byte writes
+        self.transcodes: dict[str, bytes] = {}  # item Id -> body of /Audio/<id>/stream.ogg
+        self.transcode_type: dict[str, str] = {}  # item Id -> Content-Type override
+        self.redirects: dict[str, str] = {}  # path (no query) -> Location of a 302
         self.requests: list[tuple[str, dict]] = []  # (path with query, headers)
         self.url = ""
         self._server: _Server | None = None
@@ -47,6 +50,12 @@ class FakeJellyfin:
                     return self._send(401)
                 if parts.path in fake.fail:
                     return self._send(fake.fail[parts.path])
+                if parts.path in fake.redirects:
+                    self.send_response(302)
+                    self.send_header("Location", fake.redirects[parts.path])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if parts.path in fake.html:
                     return self._send(200, b"<html>proxy login</html>", "text/html")
                 segs = parts.path.strip("/").split("/")
@@ -75,6 +84,26 @@ class FakeJellyfin:
                             pass
                         return
                     self.wfile.write(data[: len(data) // 2] if segs[1] in fake.truncate else data)
+                    return
+                if len(segs) == 3 and segs[0] == "Audio" and segs[2] == "stream.ogg":
+                    data = fake.transcodes.get(segs[1])
+                    if data is None:
+                        return self._send(404)
+                    self.send_response(200)
+                    self.send_header("Content-Type", fake.transcode_type.get(segs[1], "audio/ogg"))
+                    if segs[1] in fake.truncate:  # only a declared length reveals a short body
+                        self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()  # otherwise streamed: no Content-Length, ends on close
+                    try:
+                        if segs[1] in fake.trickle:
+                            for i in range(0, len(data), 4):
+                                self.wfile.write(data[i:i + 4])
+                                self.wfile.flush()
+                                time.sleep(fake.trickle[segs[1]])
+                        else:
+                            self.wfile.write(data[: len(data) // 2] if segs[1] in fake.truncate else data)
+                    except OSError:  # the client gave up
+                        pass
                     return
                 self._send(404)
 

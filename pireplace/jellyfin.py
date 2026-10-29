@@ -38,6 +38,7 @@ class Track:
     title: str | None
     container: str | None
     size: int | None
+    duration_s: float | None = None
 
 
 class TrackList(list):
@@ -77,12 +78,15 @@ def _track(raw: dict) -> Track | None:
     size = source.get("Size") if source is not None else None
     if isinstance(size, bool) or not isinstance(size, int):
         size = None
+    ticks = raw.get("RunTimeTicks")
+    duration = ticks / 10_000_000 if isinstance(ticks, int) and not isinstance(ticks, bool) and ticks > 0 else None
     return Track(
         id=item_id,
         artist=artist,
         title=_str_or_none(raw.get("Name")),
         container=container.lower() if container else None,
         size=size,
+        duration_s=duration,
     )
 
 
@@ -181,6 +185,60 @@ class JellyfinClient:
                     if err is None:
                         out.flush()
                         os.fsync(out.fileno())
+            except (OSError, http.client.HTTPException, ValueError):
+                err = f"download failed for {path}"
+        if err is not None:
+            dest.unlink(missing_ok=True)
+            raise JellyfinError(err) from None
+        return written
+
+    def download_transcoded(self, item_id: str, dest: Path, bitrate_kbps: int) -> int:
+        """Write an Opus-in-Ogg transcode of the item to `dest`, which must not exist.
+
+        Jellyfin streams transcodes, so Content-Length is usually absent: the body is
+        accepted only if the Content-Type is ``audio/*`` and it starts with ``OggS``.
+        Fsynced before returning. On any error `dest` is removed.
+        """
+        dest = Path(dest)
+        path = f"/Audio/{urllib.parse.quote(item_id, safe='')}/stream.ogg"
+        query = urllib.parse.urlencode({
+            "audioCodec": "opus",
+            "audioBitRate": int(bitrate_kbps) * 1000,
+            "audioChannels": 2,
+            "static": "false",
+            "userId": self._user_id,
+        })
+        written = 0
+        deadline = time.monotonic() + self._download_deadline
+        resp, err = self._request(path, query)
+        if resp is not None:
+            try:
+                with closing(resp):
+                    ctype = (resp.headers.get("Content-Type") or "").strip().lower()
+                    if not ctype.startswith("audio/"):
+                        err = f"unexpected content type from {path}"
+                    else:
+                        head = b""
+                        with open(dest, "xb") as out:
+                            while chunk := resp.read1(CHUNK):
+                                if len(head) < 4:
+                                    head = (head + chunk)[:4]
+                                    if len(head) == 4 and head != b"OggS":
+                                        break
+                                out.write(chunk)
+                                written += len(chunk)
+                                if time.monotonic() > deadline:
+                                    err = f"download took longer than {self._download_deadline:g} s for {path}"
+                                    break
+                            if err is None and head != b"OggS":
+                                err = f"response from {path} is not an Ogg stream"
+                            if err is None:
+                                expected = resp.headers.get("Content-Length")
+                                if expected is not None and int(expected) != written:
+                                    err = f"incomplete download from {path}: got {written} of {expected} bytes"
+                            if err is None:
+                                out.flush()
+                                os.fsync(out.fileno())
             except (OSError, http.client.HTTPException, ValueError):
                 err = f"download failed for {path}"
         if err is not None:
