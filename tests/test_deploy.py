@@ -39,6 +39,11 @@ def test_video_unit_plays_the_video_dir_without_the_controller():
     assert "--volume=40" in exec_start.split()
 
 
+def test_video_unit_uses_the_pi4_hardware_h264_decoder():
+    args = unit("pireplace-video.service")["Service"]["ExecStart"][0].split()
+    assert [a for a in args if a.startswith("--hwdec")] == ["--hwdec=v4l2m2m-copy"]
+
+
 def test_control_unit_can_write_the_boot_marker():
     paths = unit("pireplace-control.service")["Service"]["ReadWritePaths"]
     assert any(p.lstrip("-") == "/run/pireplace" for p in paths)
