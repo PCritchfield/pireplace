@@ -1,0 +1,49 @@
+[Unit]
+Description=pireplace Wi-Fi setup hotspot watcher
+After=NetworkManager.service
+Wants=NetworkManager.service
+# Never stop restarting, however often it fails (the default gives up after 5 starts in 10 s).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pireplace
+Group=pireplace
+WorkingDirectory=/opt/pireplace
+Environment=PYTHONPATH=/opt/pireplace
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m pireplace wifi-watch --config /etc/pireplace/config.toml
+Restart=always
+RestartSec=5
+# Exit status 2 means the config or hotspot_password is invalid; restarting cannot fix that.
+RestartPreventExitStatus=2
+
+# Same directory as pireplace-control.service (scan cache and the connecting marker).
+StateDirectory=pireplace
+# NetworkManager access is granted to user pireplace by
+# /etc/polkit-1/rules.d/50-pireplace.rules; no capabilities are needed.
+CapabilityBoundingSet=
+
+# Hardening. AF_UNIX (system D-Bus) and AF_NETLINK stay open for nmcli.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

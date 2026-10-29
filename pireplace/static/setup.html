@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1a0f0a">
+<title>Fireplace Wi-Fi setup</title>
+<style>
+  :root {
+    --bg: #1a0f0a; --panel: #2a1810; --edge: #4a2c1a; --text: #f6e7d3;
+    --muted: #b99a7d; --ember: #e8741f; --ember-hi: #ffa24a;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font: 18px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 520px; margin: 0 auto; }
+  h1 { margin: 0 0 12px; font-size: 1.5rem; color: var(--ember-hi); }
+  section { background: var(--panel); border: 1px solid var(--edge); border-radius: 14px;
+            padding: 14px; margin-bottom: 14px; }
+  p { margin: 0 0 10px; }
+  .hint { color: var(--muted); font-size: .9rem; }
+  button { min-height: 48px; padding: 0 16px; font: inherit; font-weight: 600; color: var(--text);
+           background: #3a2216; border: 1px solid var(--edge); border-radius: 10px; cursor: pointer;
+           touch-action: manipulation; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--ember-hi); outline-offset: 2px; }
+  #nets { display: grid; gap: 8px; margin-bottom: 10px; }
+  #nets button { text-align: left; overflow-wrap: anywhere; }
+  #nets button[aria-pressed="true"] { background: var(--ember); border-color: var(--ember-hi); color: #1a0f0a; }
+  label { display: block; margin-bottom: 10px; }
+  input { width: 100%; min-height: 48px; padding: 0 12px; font: inherit; color: var(--text);
+          background: #140b07; border: 1px solid var(--edge); border-radius: 10px; }
+  #connect { width: 100%; background: var(--ember); color: #1a0f0a; }
+  #msg { min-height: 1.4em; margin: 10px 0 0; }
+  #msg.err { color: #ff8a7a; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Fireplace Wi-Fi setup</h1>
+
+  <section>
+    <p>Pick your home Wi-Fi network and enter its password.</p>
+    <div id="nets" role="group" aria-label="Nearby networks"></div>
+    <p id="nonets" class="hint" hidden>No networks found. Type the network name below.</p>
+    <form id="form" autocomplete="off">
+      <label>Network name
+        <input id="ssid" type="text" maxlength="32" required autocapitalize="none" autocorrect="off" spellcheck="false">
+      </label>
+      <label>Password
+        <input id="password" type="password" maxlength="63" autocapitalize="none" autocorrect="off" spellcheck="false">
+      </label>
+      <p class="hint">Leave the password empty for an open network.</p>
+      <button id="connect" type="submit">Connect</button>
+    </form>
+    <p id="msg" role="status" aria-live="polite"></p>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+
+  function say(text, isErr) {
+    var m = $("msg");
+    m.textContent = text;           // textContent only: SSIDs are untrusted
+    m.className = isErr ? "err" : "";
+  }
+
+  function pick(btn, name) {
+    var all = $("nets").children;
+    for (var i = 0; i < all.length; i++) { all[i].setAttribute("aria-pressed", "false"); }
+    btn.setAttribute("aria-pressed", "true");
+    $("ssid").value = name;
+    $("password").focus();
+  }
+
+  function showNetworks(list) {
+    var box = $("nets");
+    box.textContent = "";
+    list.forEach(function (name) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = name;
+      b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", function () { pick(b, name); });
+      box.appendChild(b);
+    });
+    $("nonets").hidden = list.length > 0;
+  }
+
+  fetch("/api/wifi/networks")
+    .then(function (r) { return r.json(); })
+    .then(function (d) { showNetworks(Array.isArray(d.networks) ? d.networks : []); })
+    .catch(function () { showNetworks([]); });
+
+  $("form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var ssid = $("ssid").value, password = $("password").value;
+    if (!ssid.trim()) { say("Enter a network name.", true); return; }
+    if (password && (password.length < 8 || password.length > 63)) {
+      say("Passwords are 8 to 63 characters.", true);
+      return;
+    }
+    $("connect").disabled = true;
+    fetch("/api/wifi/connect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssid: ssid, password: password })
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (!r.ok) { throw new Error(d.error || ("HTTP " + r.status)); }
+      });
+    }).catch(function (e) {
+      // A network failure (not an HTTP error) usually means the hotspot already went down.
+      if (e instanceof TypeError) { return; }
+      throw e;
+    }).then(function () {
+      say("Connecting. This setup network will disappear and this page will stop responding. " +
+          "Reconnect your phone to your home Wi-Fi, then open http://pireplace.local. " +
+          "If the setup network comes back, the password was probably wrong.", false);
+    }).catch(function (e) {
+      say(String(e.message || e), true);
+      $("connect").disabled = false;
+    });
+  });
+})();
+</script>
+</body>
+</html>

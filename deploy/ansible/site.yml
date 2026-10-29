@@ -1,0 +1,476 @@
+---
+# Provision a Raspberry Pi 4 (Raspberry Pi OS Lite 64-bit) as the pireplace appliance.
+#
+#   make deploy HOST=pireplace.local ANSIBLE_ARGS='-e @secrets.yml'
+#
+# Required variable: hotspot_password (8-63 characters). Set it in your own inventory,
+# an extra-vars file, or ansible-vault. It is never committed.
+# Idempotent: a second run reports changed=0.
+
+- name: Validate inputs before touching the Pi
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Require a usable hotspot_password
+      ansible.builtin.assert:
+        that:
+          - hotspot_password is defined
+          - (hotspot_password | string | length) >= 8
+          - (hotspot_password | string | length) <= 63
+          - not (hotspot_password | string).startswith('CHANGE_ME')
+        fail_msg: >-
+          hotspot_password is required: set it (8-63 characters, not the CHANGE_ME
+          placeholder) in your inventory, an extra-vars file, or ansible-vault. It
+          is the WPA2 password of the pireplace-setup hotspot and is never committed.
+        quiet: true
+
+- name: Provision pireplace
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    pireplace_user: pireplace
+    pireplace_home: /home/pireplace
+    pireplace_hostname: pireplace
+    pireplace_hotspot_ssid: pireplace-setup
+    # NetworkManager's default address for a shared (hotspot) connection.
+    pireplace_hotspot_address: 10.42.0.1
+    pireplace_allowed_hosts:
+      - "{{ pireplace_hostname }}.local"
+      - "{{ pireplace_hostname }}"
+      - localhost
+      - 127.0.0.1
+    pireplace_default_mood: classic-swing
+    pireplace_music_volume: 60
+    pireplace_log_volume: 40
+    pireplace_start_music: true
+    # The SSH user gets write access to the media folders so rsync works.
+    pireplace_admin_user: "{{ ansible_user | default(ansible_facts['env']['SUDO_USER'] | default('root')) }}"
+    pireplace_moods:
+      - modern
+      - classic-swing
+    # ALSA card of the HDMI port that carries sound: vc4hdmi0 is the port nearest the
+    # USB-C power socket (HDMI-A-1), vc4hdmi1 the one farther from it.
+    pireplace_hdmi_card: vc4hdmi0
+    pireplace_cmdline_args: quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0
+    pireplace_user_units:
+      - pireplace-video.service
+      - pireplace-music.service
+    pireplace_system_units:
+      - pireplace-control.service
+      - pireplace-wifi.service
+
+  tasks:
+    - name: Require Python 3.11 or newer on the Pi
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['python']['version_info'][0] == 3
+          - ansible_facts['python']['version_info'][1] >= 11
+        fail_msg: pireplace needs Python 3.11+; use Raspberry Pi OS Bookworm or newer.
+        quiet: true
+
+    # --- identity and packages -------------------------------------------------
+
+    - name: Set the hostname
+      ansible.builtin.hostname:
+        name: "{{ pireplace_hostname }}"
+
+    - name: Keep /etc/hosts consistent with the hostname
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1\s'
+        line: "127.0.1.1\t{{ pireplace_hostname }}"
+
+    - name: Install packages
+      ansible.builtin.apt:
+        name:
+          - mpv
+          - pipewire
+          - pipewire-pulse
+          - wireplumber
+          - network-manager
+          # polkit evaluates 50-pireplace.rules; dbus-user-session gives the lingering
+          # pireplace user manager its session bus (PipeWire, systemctl --user --machine=).
+          - polkitd
+          - dbus-user-session
+          - avahi-daemon
+          - python3
+          - unattended-upgrades
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Limit unattended-upgrades to security updates (Debian and Raspberry Pi)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/52pireplace-unattended-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          // Managed by Ansible. Replaces the default origin list: Debian security
+          // updates plus the Raspberry Pi archive (kernel/firmware fixes ship there).
+          #clear Unattended-Upgrade::Origins-Pattern;
+          Unattended-Upgrade::Origins-Pattern {
+              "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+              "origin=Debian,codename=${distro_codename},label=Debian-Security";
+              "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
+          };
+
+    - name: Enable the daily unattended-upgrades run
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    # --- service user ----------------------------------------------------------
+
+    - name: Create the pireplace group
+      ansible.builtin.group:
+        name: "{{ pireplace_user }}"
+        state: present
+
+    - name: Create the pireplace user
+      ansible.builtin.user:
+        name: "{{ pireplace_user }}"
+        group: "{{ pireplace_user }}"
+        groups: [video, render, audio]
+        append: true
+        home: "{{ pireplace_home }}"
+        create_home: true
+        shell: /usr/sbin/nologin
+        password_lock: true
+      register: pireplace_user_result
+
+    - name: Let the SSH admin user write media (member of the pireplace group)
+      ansible.builtin.user:
+        name: "{{ pireplace_admin_user }}"
+        groups: [pireplace]
+        append: true
+      when: pireplace_admin_user != 'root'
+
+    - name: Enable lingering so the user PipeWire session and player units start at boot
+      ansible.builtin.command: loginctl enable-linger {{ pireplace_user }}
+      args:
+        creates: /var/lib/systemd/linger/{{ pireplace_user }}
+
+    - name: Make sure the pireplace user manager is running
+      ansible.builtin.systemd_service:
+        name: user@{{ pireplace_user_result.uid }}.service
+        state: started
+
+    # --- application, config, media dirs --------------------------------------
+
+    - name: Create application directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /opt/pireplace
+        - /opt/pireplace/pireplace
+        - /opt/pireplace/pireplace/static
+
+    - name: Install the application code
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /opt/pireplace/pireplace/{{ item | basename }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ query('ansible.builtin.fileglob', playbook_dir + '/../../pireplace/*.py') }}"
+      notify: Restart pireplace system services
+
+    - name: Install the static web assets
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /opt/pireplace/pireplace/static/{{ item | basename }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ query('ansible.builtin.fileglob', playbook_dir + '/../../pireplace/static/*') }}"
+      notify: Restart pireplace system services
+
+    - name: Create the config directory
+      ansible.builtin.file:
+        path: /etc/pireplace
+        state: directory
+        owner: root
+        group: "{{ pireplace_user }}"
+        mode: "0750"
+
+    - name: Render the config (contains the hotspot password)
+      ansible.builtin.template:
+        src: config.toml.j2
+        dest: /etc/pireplace/config.toml
+        owner: root
+        group: "{{ pireplace_user }}"
+        mode: "0640"
+      no_log: true
+      notify: Restart pireplace system services
+
+    - name: Create media directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ pireplace_user }}"
+        group: "{{ pireplace_user }}"
+        mode: "2775"
+      loop: "{{ ['/srv/pireplace', '/srv/pireplace/videos', '/srv/pireplace/music'] + (pireplace_moods | map('regex_replace', '^', '/srv/pireplace/music/') | list) }}"
+
+    # --- systemd, tmpfiles, polkit --------------------------------------------
+
+    - name: Install the tmpfiles.d entry for the mpv sockets
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../tmpfiles/pireplace.conf"
+        dest: /etc/tmpfiles.d/pireplace.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Apply tmpfiles
+
+    - name: Install the polkit rule for NetworkManager access
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../polkit/50-pireplace.rules"
+        dest: /etc/polkit-1/rules.d/50-pireplace.rules
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install system units
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../systemd/{{ item }}"
+        dest: /etc/systemd/system/{{ item }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pireplace_system_units }}"
+      notify:
+        - Reload systemd
+        - Restart pireplace system services
+
+    - name: Install user units (run by the pireplace user manager)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../systemd/{{ item }}"
+        dest: /etc/systemd/user/{{ item }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ pireplace_user_units }}"
+      notify: Restart pireplace player units
+
+    # --- HDMI audio ------------------------------------------------------------
+    # WirePlumber's ACP only offers off/pro-audio for the vc4-hdmi cards, so no HDMI
+    # sink appears on its own. This defines one directly on ALSA's hdmi: PCM (which
+    # converts to the IEC958 subframes the vc4 hardware needs). The high priorities
+    # make WirePlumber choose it as the default sink.
+    - name: Create the pireplace PipeWire config directory
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ pireplace_user }}"
+        group: "{{ pireplace_user }}"
+        mode: "{{ item.mode | default(omit) }}"
+      loop:
+        - path: "{{ pireplace_home }}/.config"   # existing mode is kept
+        - {path: "{{ pireplace_home }}/.config/pipewire", mode: "0755"}
+        - {path: "{{ pireplace_home }}/.config/pipewire/pipewire.conf.d", mode: "0755"}
+
+    - name: Install the HDMI sink drop-in for the pireplace PipeWire
+      ansible.builtin.copy:
+        dest: "{{ pireplace_home }}/.config/pipewire/pipewire.conf.d/50-pireplace-hdmi.conf"
+        owner: "{{ pireplace_user }}"
+        group: "{{ pireplace_user }}"
+        mode: "0644"
+        content: |
+          # Managed by Ansible. HDMI sink on ALSA card {{ pireplace_hdmi_card }}.
+          context.objects = [
+              {   factory = adapter
+                  args = {
+                      factory.name     = api.alsa.pcm.sink
+                      node.name        = pireplace-hdmi
+                      node.description = "Fireplace HDMI"
+                      media.class      = Audio/Sink
+                      api.alsa.path    = "hdmi:CARD={{ pireplace_hdmi_card }},DEV=0"
+                      audio.format     = S16LE
+                      audio.rate       = 48000
+                      audio.channels   = 2
+                      audio.position   = [ FL FR ]
+                      priority.session = 2000
+                      priority.driver  = 2000
+                      node.pause-on-idle = false
+                  }
+              }
+          ]
+      notify: Restart pireplace audio and player units
+
+    - name: Apply tmpfiles and systemd changes now
+      ansible.builtin.meta: flush_handlers
+
+    # Enable per user, for pireplace only, so an admin's SSH login never starts the
+    # players. Debian's pipewire packages already enable PipeWire for every user (socket
+    # activated: idle until something plays audio); that OS default is left alone, and
+    # `is-enabled` then reports it as enabled here, which is all the players need.
+    - name: Undo the every-user enablement of the player units from older playbooks
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: false
+        scope: global
+      loop: "{{ pireplace_user_units }}"
+
+    - name: Enable PipeWire and the player units for the pireplace user
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for unit in pipewire.socket pipewire-pulse.socket wireplumber.service {{ pireplace_user_units | join(' ') }}; do
+            if ! systemctl --user --machine={{ pireplace_user }}@.host is-enabled --quiet "$unit"; then
+              systemctl --user --machine={{ pireplace_user }}@.host enable "$unit"
+              echo "enabled $unit"
+            fi
+          done
+        executable: /bin/bash
+      register: pireplace_user_enable
+      changed_when: "'enabled ' in pireplace_user_enable.stdout"
+
+    - name: Enable and start NetworkManager and Avahi
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - NetworkManager.service
+        - avahi-daemon.service
+
+    - name: Enable and start the control page and Wi-Fi watcher
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop: "{{ pireplace_system_units }}"
+
+    # --- quiet TV --------------------------------------------------------------
+
+    - name: Quiet the kernel console on the TV (takes effect after a reboot)
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/cmdline.txt
+        # Append once: only match a line that does not already end the arguments.
+        regexp: '^(?!.*\bquiet loglevel=3 logo\.nologo vt\.global_cursor_default=0 consoleblank=0\b)(.*?)\s*$'
+        line: '\1 {{ pireplace_cmdline_args }}'
+        backrefs: true
+      register: pireplace_cmdline
+
+    # WARNING: never remove the last usable console from cmdline.txt. On the Pi 4 the
+    # firmware passes 8250.nr_uarts=0, so console=serial0 is NOT usable; with no tty
+    # console the boot stalls before userspace. Move the console to the invisible tty3
+    # instead of deleting it (the HDMI screen is tty1 and stays blank). Boot messages
+    # and the rescue shell are then on tty3 (Ctrl+Alt+F3, or `journalctl -b`).
+    - name: Move the boot console from tty1 to tty3 so boot text stays off the TV (takes effect after a reboot)
+      ansible.builtin.replace:
+        path: /boot/firmware/cmdline.txt
+        regexp: '(?<!\S)console=tty1(?!\S)'
+        replace: 'console=tty3'
+      register: pireplace_console
+
+    # Neither tty1 nor tty3 present: add tty3 after console=serial0,115200 ...
+    - name: Ensure a tty3 console exists (after console=serial0,115200)
+      ansible.builtin.replace:
+        path: /boot/firmware/cmdline.txt
+        regexp: '\A(?!.*(?<!\S)console=tty3(?!\S))(.*?(?<!\S)console=serial0,115200(?!\S))'
+        replace: '\1 console=tty3'
+      register: pireplace_console_serial
+
+    # ... or, with no serial0 token either, at the start of the line.
+    - name: Ensure a tty3 console exists (at the start if no serial0 token)
+      ansible.builtin.replace:
+        path: /boot/firmware/cmdline.txt
+        regexp: '\A(?!.*(?<!\S)console=tty3(?!\S))'
+        replace: 'console=tty3 '
+      register: pireplace_console_start
+
+    # Imager's first-boot settings (user, Wi-Fi via netplan, hostname) are already
+    # applied and persist without cloud-init. To undo: delete this file.
+    - name: Ensure /etc/cloud exists
+      ansible.builtin.file:
+        path: /etc/cloud
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Disable cloud-init so its per-boot stages stay off the TV
+      ansible.builtin.file:
+        path: /etc/cloud/cloud-init.disabled
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+        modification_time: preserve
+        access_time: preserve
+
+    - name: Disable the firmware splash (takes effect after a reboot)
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^#?\s*disable_splash='
+        line: disable_splash=1
+      register: pireplace_configtxt
+
+    # The headphone jack is not used; HDMI carries the sound. lineinfile replaces the
+    # (last) existing dtparam=audio= line, or appends one, so there is exactly one.
+    - name: Turn off the onboard headphone-jack audio (takes effect after a reboot)
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^#?\s*dtparam=audio='
+        line: dtparam=audio=off
+      register: pireplace_audio_off
+
+    - name: Disable the login prompt on tty1
+      ansible.builtin.systemd_service:
+        name: getty@tty1.service
+        masked: true
+        state: stopped
+
+    - name: Tell the operator to reboot
+      ansible.builtin.debug:
+        msg: >-
+          REBOOT REQUIRED: /boot/firmware/cmdline.txt or config.txt changed. Run
+          `sudo reboot` on the Pi so the TV shows only the fire.
+      when: pireplace_cmdline is changed or pireplace_console is changed or pireplace_console_serial is changed or pireplace_console_start is changed or pireplace_configtxt is changed or pireplace_audio_off is changed
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Apply tmpfiles
+      ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/pireplace.conf
+      changed_when: true
+
+    - name: Restart pireplace system services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ pireplace_system_units }}"
+
+    - name: Restart pireplace player units
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          systemctl --user --machine={{ pireplace_user }}@.host daemon-reload
+          systemctl --user --machine={{ pireplace_user }}@.host restart {{ pireplace_user_units | join(' ') }}
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Restart pireplace audio and player units
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          systemctl --user --machine={{ pireplace_user }}@.host daemon-reload
+          systemctl --user --machine={{ pireplace_user }}@.host restart pipewire.service wireplumber.service pipewire-pulse.service
+          systemctl --user --machine={{ pireplace_user }}@.host restart {{ pireplace_user_units | join(' ') }}
+        executable: /bin/bash
+      changed_when: true
