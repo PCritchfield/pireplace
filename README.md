@@ -248,9 +248,12 @@ expected; join the main network.
 
 If the Pi has no connection for about 5 minutes it opens a Wi-Fi network called
 `pireplace-setup` (password: your `hotspot_password`). While it is up it retries
-known networks every 5 minutes. Join `pireplace-setup` on your phone, open
+known networks every 5 minutes, backing off to every 30 minutes after repeated
+failures. The hotspot stays up while a phone is connected to it, and when no Wi-Fi
+network is saved there is nothing to retry. Join `pireplace-setup` on your phone, open
 `http://10.42.0.1/setup`, pick the network and enter its password. The hotspot
 goes away once the Pi has joined. A brief router outage does not start the hotspot.
+The deploy also turns Wi-Fi power saving off, which causes dropouts on the Pi's radio.
 
 The setup page only exists while you are connected to the `pireplace-setup` hotspot:
 from the home network (or in laptop dev mode) `/setup` is "not found", so nobody on

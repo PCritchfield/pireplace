@@ -742,3 +742,40 @@ def test_validation_play_refuses_placeholders(tmp_path, extra, ok):
     assert (result.returncode == 0) is ok, result.stdout
     if not ok:
         assert "CHANGE_ME placeholder" in result.stdout
+
+
+# ---- Wi-Fi power saving --------------------------------------------------
+
+POWERSAVE_CONF = ROOT / "deploy" / "networkmanager" / "pireplace-wifi-powersave.conf"
+
+
+def test_powersave_conf_turns_wifi_power_saving_off():
+    lines = [l for l in POWERSAVE_CONF.read_text().splitlines() if l and not l.startswith("#")]
+    assert lines == ["[connection]", "wifi.powersave = 2"]
+
+
+def test_playbook_installs_iw():
+    packages = SITE.split("- name: Install packages", 1)[1].split("- name:", 1)[0]
+    assert "- iw" in packages
+
+
+def test_playbook_installs_powersave_conf_without_restarting_networkmanager():
+    task = next(t for t in _tasks() if "pireplace-wifi-powersave.conf" in str(t.get("ansible.builtin.copy", {})))
+    copy = task["ansible.builtin.copy"]
+    assert copy["src"].endswith("/../networkmanager/pireplace-wifi-powersave.conf")
+    assert copy["dest"] == "/etc/NetworkManager/conf.d/pireplace-wifi-powersave.conf"
+    assert (copy["owner"], copy["group"], copy["mode"]) == ("root", "root", "0644")
+    assert task["notify"] == "Apply Wi-Fi power saving"
+    # A restart would drop the SSH session the playbook runs over.
+    handlers = {h["name"]: h for h in yaml.safe_load(SITE)[1]["handlers"]}
+    assert "ansible.builtin.systemd_service" not in str(handlers["Apply Wi-Fi power saving"])
+    assert "restart" not in str(handlers["Apply Wi-Fi power saving"]).lower()
+
+
+def test_powersave_handler_reloads_conf_and_tolerates_a_missing_wlan0():
+    handlers = {h["name"]: h for h in yaml.safe_load(SITE)[1]["handlers"]}
+    steps = handlers["Apply Wi-Fi power saving"]["ansible.builtin.shell"]["cmd"].splitlines()
+    cmds = [l.strip() for l in steps if l.strip()]
+    assert cmds.pop(0) == "set -e"  # a failed reload must fail the play; only the iw step is optional
+    assert cmds[0] == "nmcli general reload conf"
+    assert cmds[1].startswith("iw dev wlan0 set power_save off") and cmds[1].endswith("|| true")
