@@ -92,10 +92,36 @@
     pireplace_jf_user_id: "{{ pireplace_jellyfin_user_id | default('4640835a50a94bc69709d00d6f332fac') }}"
     pireplace_jf_playlists: "{{ pireplace_jellyfin_playlists | default(pireplace_jf_default_playlists) }}"
     pireplace_jf_default_playlists:
-      modern: dc8d8d54ecad68b2546b5c7c9b4b4766
+      harvest: 2468e8f94e04ea7cd30bc7e07e2cf723
+      thanksgiving: e8fccbd51d0366b8e01c7c559280a23e
+      autumn-standards: 8168bbe27de41b39641c7decf353feac
+      four-seasons: bff6a0a9d940b5422c8c632c4bea3946
+      spooky-classics: c2a72fb4b5e405f93e0f49073ff5465d
+      monster-party: 99994b20b9e956085b7e570729cb9cf1
+      graveyard-punk: dd675304017333b0dd2e8cdd8122719f
+      goth-night: ce2cc8851c29a131ba05149e04fceb02
       classic-swing: f4b96696936ec335bfeca0c623ad0669
+      modern: dc8d8d54ecad68b2546b5c7c9b4b4766
       soul-motown: 79525d419fccb3bec7c38cef5fe07b11
       instrumental: 30bf4d0f66600b1d1dd8cded00e25705
+    # Audio the sync stores: "opus" (Jellyfin transcodes, about 3 GB for all twelve moods)
+    # or "original" (files as uploaded). Optional inventory vars pireplace_jellyfin_audio_format
+    # and pireplace_jellyfin_audio_bitrate_kbps (64-320, opus only).
+    pireplace_jf_audio_format: "{{ pireplace_jellyfin_audio_format | default('opus') }}"
+    pireplace_jf_audio_bitrate_kbps: "{{ pireplace_jellyfin_audio_bitrate_kbps | default(160) }}"
+    # Seasons: the control page's season picker, in display order. Optional inventory
+    # override pireplace_seasons_custom (same shape; an empty list turns the picker off).
+    pireplace_seasons: "{{ pireplace_seasons_custom | default(pireplace_seasons_default) }}"
+    pireplace_seasons_default:
+      - name: fall
+        label: Fall
+        moods: [harvest, thanksgiving, autumn-standards, four-seasons]
+      - name: halloween
+        label: Halloween
+        moods: [spooky-classics, monster-party, graveyard-punk, goth-night]
+      - name: winter
+        label: Winter
+        moods: [classic-swing, modern, soul-motown, instrumental]
     pireplace_sync_units:
       - pireplace-sync.service
       - pireplace-sync.timer

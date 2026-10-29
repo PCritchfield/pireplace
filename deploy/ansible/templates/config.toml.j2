@@ -16,6 +16,16 @@ start_music = {{ pireplace_start_music | bool | lower }}
 default_mood = {{ pireplace_default_mood | to_json }}
 music_volume = {{ pireplace_music_volume | int }}
 log_volume = {{ pireplace_log_volume | int }}
+{% if pireplace_seasons | length > 0 %}
+
+# Seasons, in display order: the control page's season picker.
+{% for season in pireplace_seasons %}
+
+[seasons.{{ season.name }}]
+label = {{ season.label | to_json }}
+moods = {{ season.moods | to_json }}
+{% endfor %}
+{% endif %}
 
 [web]
 host = "0.0.0.0"
@@ -38,6 +48,8 @@ hotspot_address = {{ pireplace_hotspot_address | to_json }}
 url = {{ pireplace_jf_url | to_json }}
 user_id = {{ pireplace_jf_user_id | to_json }}
 api_key_file = "/etc/pireplace/jellyfin.key"
+audio_format = {{ pireplace_jf_audio_format | to_json }}
+audio_bitrate_kbps = {{ pireplace_jf_audio_bitrate_kbps | int }}
 
 [jellyfin.playlists]
 {% for mood, playlist_id in pireplace_jf_playlists.items() %}

@@ -629,6 +629,78 @@ def _render_config(extra: dict, directory: Path) -> Path:
     return out
 
 
+EXPECTED_PLAYLISTS = {
+    "harvest": "2468e8f94e04ea7cd30bc7e07e2cf723",
+    "thanksgiving": "e8fccbd51d0366b8e01c7c559280a23e",
+    "autumn-standards": "8168bbe27de41b39641c7decf353feac",
+    "four-seasons": "bff6a0a9d940b5422c8c632c4bea3946",
+    "spooky-classics": "c2a72fb4b5e405f93e0f49073ff5465d",
+    "monster-party": "99994b20b9e956085b7e570729cb9cf1",
+    "graveyard-punk": "dd675304017333b0dd2e8cdd8122719f",
+    "goth-night": "ce2cc8851c29a131ba05149e04fceb02",
+    "classic-swing": "f4b96696936ec335bfeca0c623ad0669",
+    "modern": "dc8d8d54ecad68b2546b5c7c9b4b4766",
+    "soul-motown": "79525d419fccb3bec7c38cef5fe07b11",
+    "instrumental": "30bf4d0f66600b1d1dd8cded00e25705",
+}
+OWNER_SEASONS = [
+    ("fall", "Fall", ["harvest", "thanksgiving", "autumn-standards", "four-seasons"]),
+    ("halloween", "Halloween",
+     ["spooky-classics", "monster-party", "graveyard-punk", "goth-night"]),
+    ("winter", "Winter", ["classic-swing", "modern", "soul-motown", "instrumental"]),
+]
+
+
+def test_default_playlists_include_fall_and_halloween():
+    defaults = yaml.safe_load(SITE)[1]["vars"]["pireplace_jf_default_playlists"]
+    assert list(defaults.items()) == list(EXPECTED_PLAYLISTS.items())
+
+
+def test_template_renders_seasons_in_order(tmp_path):
+    from pireplace.config import load_config
+
+    path = _render_config({}, tmp_path)
+    cfg = load_config(path)
+    assert [(s.name, s.label, list(s.moods)) for s in cfg.seasons] == OWNER_SEASONS
+    text = path.read_text()
+    assert text.index("[playback]") < text.index("[seasons.fall]")
+    assert text.index("[seasons.fall]") < text.index("[seasons.halloween]") < text.index(
+        "[seasons.winter]"
+    )
+
+
+def test_template_renders_seasons_from_an_inventory_override(tmp_path):
+    from pireplace.config import load_config
+
+    custom = [{"name": "summer", "label": "Summer", "moods": ["beach"]}]
+    cfg = load_config(_render_config({"pireplace_seasons_custom": custom}, tmp_path))
+    assert [(s.name, s.label, list(s.moods)) for s in cfg.seasons] == [("summer", "Summer", ["beach"])]
+
+
+def test_template_omits_seasons_when_empty(tmp_path):
+    import tomllib
+
+    from pireplace.config import load_config
+
+    path = _render_config({"pireplace_seasons_custom": []}, tmp_path)
+    assert "seasons" not in tomllib.loads(path.read_text())
+    assert load_config(path).seasons == ()
+
+
+def test_template_renders_audio_profile(tmp_path):
+    from pireplace.config import load_jellyfin_config
+
+    cfg = load_jellyfin_config(_render_config({"pireplace_jellyfin_api_key": "k"}, tmp_path))
+    assert (cfg.audio_format, cfg.audio_bitrate_kbps) == ("opus", 160)
+
+    other = tmp_path / "other"
+    other.mkdir()
+    cfg = load_jellyfin_config(_render_config(
+        {"pireplace_jellyfin_api_key": "k", "pireplace_jellyfin_audio_format": "original",
+         "pireplace_jellyfin_audio_bitrate_kbps": 96}, other))
+    assert (cfg.audio_format, cfg.audio_bitrate_kbps) == ("original", 96)
+
+
 def test_template_renders_a_loadable_jellyfin_section_only_with_a_key(tmp_path):
     import tomllib
 
@@ -637,17 +709,14 @@ def test_template_renders_a_loadable_jellyfin_section_only_with_a_key(tmp_path):
     with_key = _render_config({"pireplace_jellyfin_api_key": "s3cret-key"}, tmp_path)
     data = tomllib.loads(with_key.read_text())
     assert "s3cret-key" not in with_key.read_text()
-    assert set(data["jellyfin"]) == {"url", "user_id", "api_key_file", "playlists"}
+    assert set(data["jellyfin"]) == {
+        "url", "user_id", "api_key_file", "playlists", "audio_format", "audio_bitrate_kbps",
+    }
     cfg = load_jellyfin_config(with_key)
     assert cfg.url == "http://100.88.8.6:8096"
     assert cfg.user_id == "4640835a50a94bc69709d00d6f332fac"
     assert str(cfg.api_key_file) == "/etc/pireplace/jellyfin.key"
-    assert cfg.playlists == {
-        "modern": "dc8d8d54ecad68b2546b5c7c9b4b4766",
-        "classic-swing": "f4b96696936ec335bfeca0c623ad0669",
-        "soul-motown": "79525d419fccb3bec7c38cef5fe07b11",
-        "instrumental": "30bf4d0f66600b1d1dd8cded00e25705",
-    }
+    assert cfg.playlists == EXPECTED_PLAYLISTS
 
     for n, extra in enumerate(({}, {"pireplace_jellyfin_api_key": ""})):
         directory = tmp_path / f"without{n}"
