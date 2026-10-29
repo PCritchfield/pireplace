@@ -659,7 +659,7 @@ def test_default_playlists_include_fall_and_halloween():
 def test_template_renders_seasons_in_order(tmp_path):
     from pireplace.config import load_config
 
-    path = _render_config({}, tmp_path)
+    path = _render_config({"pireplace_jellyfin_api_key": "k"}, tmp_path)
     cfg = load_config(path)
     assert [(s.name, s.label, list(s.moods)) for s in cfg.seasons] == OWNER_SEASONS
     text = path.read_text()
@@ -675,6 +675,12 @@ def test_template_renders_seasons_from_an_inventory_override(tmp_path):
     custom = [{"name": "summer", "label": "Summer", "moods": ["beach"]}]
     cfg = load_config(_render_config({"pireplace_seasons_custom": custom}, tmp_path))
     assert [(s.name, s.label, list(s.moods)) for s in cfg.seasons] == [("summer", "Summer", ["beach"])]
+
+
+def test_default_seasons_need_the_sync(tmp_path):
+    from pireplace.config import load_config
+
+    assert load_config(_render_config({}, tmp_path)).seasons == ()
 
 
 def test_template_omits_seasons_when_empty(tmp_path):
@@ -960,3 +966,74 @@ def test_first_profile_backup_cannot_fail_the_play_and_runs_after_the_services()
     first = names.index("Back up the NetworkManager profiles once now")
     assert first > names.index("Enable and start the control page and Wi-Fi watcher")
     assert tasks[first]["failed_when"] is False and "register" in tasks[first]
+
+
+def _seasons_checks(extra: dict) -> dict:
+    """Evaluate the `that` conditions of the two season pre-flight asserts."""
+    templar, trust = _templar(extra)
+    out = {}
+    for name in ("Require valid seasons", "Require a source for every season mood"):
+        for cond in _task(name)["ansible.builtin.assert"]["that"]:
+            out[cond] = templar.template(trust("{{ " + cond + " }}"))
+    return out
+
+
+def _failing(extra: dict) -> list[str]:
+    return [c for c, v in _seasons_checks(extra).items() if v is not True]
+
+
+def _custom(moods=("harvest",), name="x", label="X", **extra):
+    seasons = [{"name": name, "label": label, "moods": list(moods)}]
+    return {"pireplace_seasons_custom": seasons, **extra}
+
+
+def test_season_preflight_passes_for_the_defaults():
+    for sync in ({}, {"pireplace_jellyfin_api_key": "k"}):  # off: no default seasons at all
+        results = _seasons_checks(sync)
+        assert results and all(v is True for v in results.values()), results
+
+
+@pytest.mark.parametrize("name", ["Fall", "-a", "a_b", "", "a b", "a\n"])
+def test_season_preflight_rejects_a_bad_season_name(name):
+    assert any("bad_names" in c for c in _failing(_custom(name=name, moods=["modern"])))
+
+
+@pytest.mark.parametrize("label", ["", "   ", 5])
+def test_season_preflight_rejects_a_bad_label(label):
+    assert any("bad_labels" in c for c in _failing(_custom(label=label, moods=["modern"])))
+
+
+@pytest.mark.parametrize("mood", ["Harvest", "-x", "a_b", ""])
+def test_season_preflight_rejects_a_bad_mood_name(mood):
+    assert any("bad_moods" in c for c in _failing(_custom(moods=[mood])))
+
+
+def test_season_preflight_rejects_empty_moods_and_a_mood_in_two_seasons():
+    assert _failing(_custom(moods=[]))
+    two = {"pireplace_seasons_custom": [
+        {"name": "a", "label": "A", "moods": ["modern"]},
+        {"name": "b", "label": "B", "moods": ["modern"]},
+    ]}
+    assert _failing(two)
+
+
+def test_season_preflight_rejects_moods_with_no_source():
+    # Sync off: sources are pireplace_moods (modern, classic-swing) only.
+    assert _failing(_custom(moods=["harvest"]))
+    assert not _failing(_custom(moods=["modern"]))
+    # Sync on: sources are the playlist keys.
+    on = {"pireplace_jellyfin_api_key": "k"}
+    assert not _failing(_custom(moods=["harvest"], **on))
+    assert _failing(_custom(moods=["nowhere"], **on))
+    only = {"pireplace_jellyfin_playlists": {"beach": "0" * 32}}
+    assert _failing(_custom(moods=["harvest"], **on, **only))
+
+
+def test_template_keeps_non_ascii_and_quoted_labels_valid(tmp_path):
+    from pireplace.config import load_config
+
+    for n, label in enumerate(["🎃 Halloween", 'Say "hi" \\ back']):
+        directory = tmp_path / str(n)
+        directory.mkdir()
+        cfg = load_config(_render_config(_custom(label=label, moods=["modern"]), directory))
+        assert cfg.seasons[0].label == label

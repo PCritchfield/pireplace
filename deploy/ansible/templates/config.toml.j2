@@ -22,7 +22,7 @@ log_volume = {{ pireplace_log_volume | int }}
 {% for season in pireplace_seasons %}
 
 [seasons.{{ season.name }}]
-label = {{ season.label | to_json }}
+label = {{ season.label | to_json(ensure_ascii=False) }}
 moods = {{ season.moods | to_json }}
 {% endfor %}
 {% endif %}

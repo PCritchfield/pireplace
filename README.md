@@ -97,10 +97,10 @@ season's moods. Picking a season starts its first mood that has tracks, exactly 
 tapping that mood would; nothing ever switches season by itself. With no seasons (or
 only one) there is no picker and the page behaves as before.
 
-The deploy defaults are Fall (`harvest`, `thanksgiving`, `autumn-standards`,
+With the Jellyfin sync on, the deploy defaults are Fall (`harvest`, `thanksgiving`, `autumn-standards`,
 `four-seasons`), Halloween (`spooky-classics`, `monster-party`, `graveyard-punk`,
 `goth-night`) and Winter (`classic-swing`, `modern`, `soul-motown`, `instrumental`),
-in that order. To define your own, set `pireplace_seasons_custom` in a vars file
+in that order (without the sync there are no default seasons). To define your own, set `pireplace_seasons_custom` in a vars file
 (`-e @seasons.yml`), in display order; `[]` turns the picker off:
 
 ```yaml
@@ -110,7 +110,10 @@ pireplace_seasons_custom:
     moods: [beach, barbecue]
 ```
 
-Each mood belongs to at most one season. This renders `[seasons.<name>]` tables
+Each mood belongs to at most one season, and must be a playlist in
+`pireplace_jellyfin_playlists` (sync on) or listed in `pireplace_moods`; the deploy
+checks names, labels and moods before it changes anything. Music folders that are in no
+season show up under an automatic "Other" season. This renders `[seasons.<name>]` tables
 (`label`, `moods`) in `/etc/pireplace/config.toml`; table order is display order. The
 current season is the one holding the current mood (else `default_mood`, else the first
 season).
@@ -210,10 +213,10 @@ fails cleanly and the music keeps playing; a failed run is retried every 10 minu
 to 4 times, before it waits for the next night (a config error is not retried).
 
 **Add a mood.** Create a playlist in Jellyfin (shared with the sync user in the create
-call, see step 1, or public), then
-add `name: <playlist Id>` to `pireplace_jellyfin_playlists` (keep the existing twelve,
-since the map replaces the default), put the mood in a season (see "Seasons") and deploy; the folder is created and the next sync
-fills it. Mood names are lowercase letters, digits and `-`.
+call, see step 1, or public), then add `name: <playlist Id>` to
+`pireplace_jellyfin_playlists` (keep the existing twelve, since the map replaces the
+default), put the mood in a season (see "Seasons") and deploy; the folder is created
+and the next sync fills it. Mood names are lowercase letters, digits and `-`.
 
 **Retire a mood.** Remove it from the map and deploy. Its folder and files stay on the
 Pi, so delete them by hand (`rm -r /srv/pireplace/music/<mood>`) and press Rescan.
