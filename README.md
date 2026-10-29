@@ -81,6 +81,10 @@ rsync -av ~/Music/Christmas/ <user>@pireplace.local:/srv/pireplace/music/christm
 **Add a mood:** make a folder, put music in it, press **Rescan media** on the
 control page. `christmas` shows as "Christmas", `classic-swing` as "Classic Swing".
 
+The page's colours and header icon follow the music mood: `classic-swing`, `modern`,
+`soul-motown` and `instrumental` each have a Christmas palette (`modern` and `instrumental`
+get a little static snow). Any other mood, or no mood, shows the warm fire colours.
+
 ```sh
 ssh <user>@pireplace.local mkdir /srv/pireplace/music/christmas
 ```
