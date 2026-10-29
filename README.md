@@ -259,6 +259,30 @@ The setup page only exists while you are connected to the `pireplace-setup` hots
 from the home network (or in laptop dev mode) `/setup` is "not found", so nobody on
 your Wi-Fi can change the Pi's network.
 
+## Network safety net
+
+NetworkManager once stored two profiles as netplan YAML and left them empty, which cost
+the Pi all networking. The deploy now guards against that:
+
+- Profiles are NetworkManager keyfiles only. Any profile found under `/etc/netplan/` is
+  migrated to a keyfile, and a cloud-init drop-in stops cloud-init (the Raspberry Pi
+  Imager `network-config`) from rendering network config again.
+- Good profiles are copied to `/var/lib/pireplace-netbackup` (root only, mode 0700)
+  whenever `/etc/NetworkManager/system-connections` changes and once per boot
+  (`pireplace-netbackup.path` and `.service`). A profile you delete with `nmcli` is
+  dropped from the backup, unless that would leave no Wi-Fi profile at all.
+- Before NetworkManager starts, `pireplace-netrestore.service` puts a backed-up profile
+  back when its file is empty or invalid, and restores all of them when every Wi-Fi
+  profile (other than `pireplace-hotspot`) is gone. A valid profile is never overwritten.
+  NetworkManager does not depend on it, so a failure there cannot block networking.
+- The journal is persistent (the Pi default is volatile), capped at 64 MB on the SD
+  card and kept for a month. To look at the previous boot:
+
+      journalctl -b -1 -u pireplace-wifi
+      journalctl -k -b -1 | grep -i voltage
+
+The backup holds Wi-Fi passwords; nothing here logs them.
+
 ## Laptop development
 
 The app runs on a laptop with mpv windows instead of the TV.
