@@ -125,8 +125,8 @@ def _open_nofollow(path: Path):
     return os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb")
 
 
-def _last_granule(tail: bytes) -> int | None:
-    """Granule position of the Ogg page that ends exactly at the end of `tail`."""
+def _last_page(tail: bytes) -> tuple[int, bytes] | None:
+    """(granule, serial) of the Ogg page that ends exactly at the end of `tail`."""
     end = len(tail)
     while (i := tail.rfind(b"OggS", 0, end)) >= 0:
         end = i
@@ -136,7 +136,7 @@ def _last_granule(tail: bytes) -> int | None:
         table = tail[nseg_at + 1:nseg_at + 1 + tail[nseg_at]]
         if len(table) == tail[nseg_at] and nseg_at + 1 + len(table) + sum(table) == len(tail):
             granule = int.from_bytes(tail[i + 6:i + 14], "little", signed=True)
-            return granule if granule >= 0 else None
+            return (granule, tail[i + 14:i + 18]) if granule >= 0 else None
     return None
 
 
@@ -144,14 +144,15 @@ def ogg_duration_s(path: Path) -> float | None:
     """Length of an Opus-in-Ogg file from its headers; None if it cannot be read.
 
     (granule of the last page - OpusHead pre-skip) / 48000. The last page is the one
-    that ends exactly at the end of the file, so a stream cut mid-page has none.
+    that ends exactly at the end of the file, so a stream cut mid-page has none, and it
+    must belong to the OpusHead's logical stream (same serial): a chained file is refused.
     """
     try:
         with _open_nofollow(path) as f:
             head = f.read(OGG_HEADER + 255 + OPUS_HEAD_LEN)
             size = os.fstat(f.fileno()).st_size
             f.seek(max(0, size - OGG_TAIL))
-            tail = f.read()
+            tail = f.read(OGG_TAIL)
     except OSError:
         return None
     if len(head) < OGG_HEADER or head[:4] != b"OggS" or head[4] != 0:
@@ -161,8 +162,11 @@ def ogg_duration_s(path: Path) -> float | None:
     if len(packet) < OPUS_HEAD_LEN or packet[:8] != b"OpusHead":
         return None
     pre_skip = int.from_bytes(packet[10:12], "little")
-    granule = _last_granule(tail)
-    if granule is None or granule <= pre_skip:
+    last = _last_page(tail)
+    if last is None or last[1] != head[14:18]:
+        return None
+    granule = last[0]
+    if granule <= pre_skip:
         return None
     return (granule - pre_skip) / 48000
 
