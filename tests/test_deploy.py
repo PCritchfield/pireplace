@@ -101,6 +101,7 @@ def test_netbackup_runs_after_networkmanager_on_changes_and_once_per_boot():
     path = unit("pireplace-netbackup.path")
     assert path["Path"]["PathChanged"] == ["/etc/NetworkManager/system-connections"]
     assert path["Path"]["Unit"] == ["pireplace-netbackup.service"]
+    assert path["Path"]["TriggerLimitIntervalSec"] == ["0"]
     assert path["Install"]["WantedBy"] == ["multi-user.target"]
 
 

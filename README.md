@@ -282,7 +282,10 @@ the Pi all networking. The deploy now guards against that:
       journalctl -b -1 -u pireplace-wifi
       journalctl -k -b -1 | grep -i voltage
 
-A complete live profile replaces its backup (the previous version is kept as `.prev`); a
+A complete live profile replaces its backup; the three previous copies are kept as
+`NAME.prev.1` (newest) to `NAME.prev.3`. Recovering one is manual: as root, copy
+`NAME.prev.N` over `/etc/NetworkManager/system-connections/NAME`, then run
+`nmcli connection reload`. A
 truncated or incomplete one never does, nor does a WPA profile that lost its `psk` (a
 warning names the `netbackup-forget` fix). A live file the restore cannot read or
 understand is left alone; a bad file it replaces is kept in the backup directory as

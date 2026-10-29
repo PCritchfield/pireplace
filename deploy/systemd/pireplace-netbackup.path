@@ -4,6 +4,8 @@ Description=pireplace: watch the NetworkManager profiles for changes
 [Path]
 PathChanged=/etc/NetworkManager/system-connections
 Unit=pireplace-netbackup.service
+# Bursts of changes (NM rewriting files) must never trip the path unit's trigger limit.
+TriggerLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

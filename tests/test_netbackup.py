@@ -83,8 +83,8 @@ def test_sync_updates_changed_keeps_prev_and_leaves_unchanged_alone(dirs):
     put(live, "home.nmconnection", profile(psk="changed"))
     netbackup.sync(live, backup)
     assert "psk=changed" in (backup / "home.nmconnection").read_text()
-    assert (backup / "home.nmconnection.prev").read_text() == profile()
-    assert mode(backup / "home.nmconnection.prev") == 0o600
+    assert (backup / "home.nmconnection.prev.1").read_text() == profile()
+    assert mode(backup / "home.nmconnection.prev.1") == 0o600
 
 
 def test_sync_prunes_deleted_profile_when_other_wifi_remains(dirs):
@@ -139,7 +139,7 @@ def test_complete_open_network_switch_replaces_and_keeps_prev(dirs):
     put(live, "home.nmconnection", profile(psk="x").split("[wifi-security]")[0])
     assert netbackup.sync(live, backup) == []
     assert "wifi-security" not in (backup / "home.nmconnection").read_text()
-    assert (backup / "home.nmconnection.prev").read_text() == profile()
+    assert (backup / "home.nmconnection.prev.1").read_text() == profile()
 
 
 def test_same_name_new_uuid_replaces_and_keeps_prev(dirs):
@@ -149,7 +149,7 @@ def test_same_name_new_uuid_replaces_and_keeps_prev(dirs):
     put(live, "home.nmconnection", profile(uuid="another"))
     assert netbackup.sync(live, backup) == []
     assert "uuid=another" in (backup / "home.nmconnection").read_text()
-    assert (backup / "home.nmconnection.prev").read_text() == profile()
+    assert (backup / "home.nmconnection.prev.1").read_text() == profile()
 
 
 def test_wpa_psk_without_psk_keeps_backup_warns_exits_zero_and_still_prunes(dirs, caplog):
@@ -406,7 +406,7 @@ def test_forget_removes_backup_and_prev(dirs):
     netbackup.sync(live, backup)
     put(live, "home.nmconnection", profile(psk="b"))
     netbackup.sync(live, backup)
-    assert (backup / "home.nmconnection.prev").exists()
+    assert (backup / "home.nmconnection.prev.1").exists()
     assert main(["netbackup-forget", "home.nmconnection", "--backup", str(backup)]) == 0
     assert names(backup) == []
     assert main(["netbackup-forget", "home.nmconnection", "--backup", str(backup)]) == 1
@@ -459,3 +459,49 @@ def test_cli_errors_exit_one_with_a_short_message(dirs, tmp_path, capsys):
     assert main(["netbackup-sync", "--live", str(live), "--backup", str(blocker / "sub")]) == 1
     err = capsys.readouterr().err
     assert err.startswith("pireplace: cannot create") and "Traceback" not in err
+
+
+def test_three_generations_are_kept_and_a_fourth_drops_the_oldest(dirs):
+    live, backup = dirs
+    for i in range(5):
+        put(live, "home.nmconnection", profile(psk=f"v{i}"))
+        netbackup.sync(live, backup)
+    read = lambda suffix: (backup / f"home.nmconnection{suffix}").read_text()  # noqa: E731
+    assert "psk=v4" in read("") and "psk=v3" in read(".prev.1")
+    assert "psk=v2" in read(".prev.2") and "psk=v1" in read(".prev.3")
+    assert not (backup / "home.nmconnection.prev.4").exists()
+    for n in (1, 2, 3):
+        assert mode(backup / f"home.nmconnection.prev.{n}") == 0o600
+
+
+def test_legacy_prev_migrates_to_prev_1(dirs):
+    live, backup = dirs
+    put(live, "home.nmconnection", profile())
+    netbackup.sync(live, backup)
+    (backup / "home.nmconnection.prev").write_text("legacy")
+    netbackup.sync(live, backup)
+    assert not (backup / "home.nmconnection.prev").exists()
+    assert (backup / "home.nmconnection.prev.1").read_text() == "legacy"
+
+
+def test_forget_removes_every_generation(dirs):
+    live, backup = dirs
+    for i in range(4):
+        put(live, "home.nmconnection", profile(psk=f"v{i}"))
+        netbackup.sync(live, backup)
+    (backup / "home.nmconnection.prev").write_text("legacy")
+    assert main(["netbackup-forget", "home.nmconnection", "--backup", str(backup)]) == 0
+    assert names(backup) == []
+
+
+def test_dropping_the_wifi_security_section_warns_but_replaces(dirs, caplog):
+    live, backup = dirs
+    put(live, "home.nmconnection", profile())
+    netbackup.sync(live, backup)
+    put(live, "home.nmconnection", profile().split("[wifi-security]")[0])
+    with caplog.at_level(logging.WARNING):
+        assert netbackup.sync(live, backup) == []
+    assert "home.nmconnection: Wi-Fi password section removed; previous copies kept as " \
+           "home.nmconnection.prev.1..3" in caplog.text
+    assert SECRET not in caplog.text
+    assert (backup / "home.nmconnection.prev.1").read_text() == profile()

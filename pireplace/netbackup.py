@@ -24,7 +24,9 @@ log = logging.getLogger("pireplace.netbackup")
 DEFAULT_LIVE = "/etc/NetworkManager/system-connections"
 DEFAULT_BACKUP = "/var/lib/pireplace-netbackup"
 SUFFIX = ".nmconnection"
-PREV = ".prev"
+PREV = ".prev"  # legacy single copy; now PREV.1 (newest) .. PREV.3
+GENERATIONS = 3
+SECURITY_SECTIONS = {"wifi-security", "802-11-wireless-security"}
 TMP_PREFIX = ".tmp-"
 HOTSPOT_ID = "pireplace-hotspot"
 WIFI_TYPES = ("802-11-wireless", "wifi")
@@ -204,6 +206,33 @@ def _unlink(path: Path) -> bool:
 KEEP_CORRUPT = 5
 
 
+def _prev_names(name: str) -> list[str]:
+    return [f"{name}{PREV}"] + [f"{name}{PREV}.{n}" for n in range(1, GENERATIONS + 1)]
+
+
+def _rotate(backup: Path, name: str, old_data: bytes) -> None:
+    """Shift .prev.N copies up (dropping the oldest) and store `old_data` as .prev.1."""
+    for n in range(GENERATIONS - 1, 0, -1):
+        src = backup / f"{name}{PREV}.{n}"
+        if os.path.lexists(src):
+            os.replace(src, backup / f"{name}{PREV}.{n + 1}")
+    _write_atomic(backup, f"{name}{PREV}.1", old_data)
+
+
+def _migrate_legacy_prev(backup: Path) -> None:
+    """Rename a legacy `<name>.prev` to `.prev.1` (or drop it if .prev.1 already exists)."""
+    for fname in _listdir(backup):
+        if fname.endswith(SUFFIX + PREV):
+            target = backup / (fname + ".1")
+            try:
+                if os.path.lexists(target):
+                    os.unlink(backup / fname)
+                else:
+                    os.replace(backup / fname, target)
+            except OSError as e:
+                log.error("cannot migrate %s: %s", fname, _oserror(e))
+
+
 def _trim_corrupt(backup: Path) -> None:
     """Keep only the newest KEEP_CORRUPT `<name>.corrupt-<unix-ts>` copies per profile."""
     groups: dict[str, list[tuple[int, str]]] = {}
@@ -235,6 +264,7 @@ def sync(live: Path, backup: Path) -> list[str]:
     _ensure_dir(backup, 0o700)
     _clean_tmp(backup)
     _clean_tmp(live)
+    _migrate_legacy_prev(backup)
     live_profiles = _profiles(live)
     saved = _profiles(backup)
 
@@ -250,7 +280,10 @@ def sync(live: Path, backup: Path) -> list[str]:
                         "kept backup of %s: live copy lost its psk; if that is intended, "
                         "run: python3 -m pireplace netbackup-forget %s", name, name)
                     continue
-                _write_atomic(backup, name + PREV, old.data)
+                if old.profile.has_psk and not new.profile.sections & SECURITY_SECTIONS:
+                    log.warning("%s: Wi-Fi password section removed; previous copies kept as %s.prev.1..%d",
+                                name, name, GENERATIONS)
+                _rotate(backup, name, old.data)
             _write_atomic(backup, name, new.data)
             log.info("backed up %s", name)
         except OSError as e:
@@ -274,7 +307,8 @@ def sync(live: Path, backup: Path) -> list[str]:
             continue
         try:
             _unlink(backup / name)
-            _unlink(backup / (name + PREV))
+            for extra in _prev_names(name):
+                _unlink(backup / extra)
             log.info("pruned %s (%s)", name, reason)
         except OSError as e:
             log.error("cannot prune %s: %s", name, _oserror(e))
@@ -330,11 +364,11 @@ def restore(live: Path, backup: Path) -> list[str]:
 
 
 def forget(backup: Path, name: str) -> list[str]:
-    """Remove a profile (and its .prev) from the backup; returns the removed file names."""
+    """Remove a profile (and all its .prev copies) from the backup; returns the removed file names."""
     if os.path.basename(name) != name or not name.endswith(SUFFIX):
         raise NetbackupError("not a profile file name (expected NAME.nmconnection)")
     removed = []
-    for victim in (name, name + PREV):
+    for victim in (name, *_prev_names(name)):
         try:
             if _unlink(Path(backup) / victim):
                 removed.append(victim)
