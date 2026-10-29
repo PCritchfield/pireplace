@@ -23,6 +23,18 @@ class UnknownMood(Exception):
     """Requested mood is not a folder with tracks under the music dir."""
 
 
+class UnknownSeason(Exception):
+    """Requested season is not configured (and is not the implicit "other")."""
+
+
+class EmptySeason(Exception):
+    """The season has no mood with tracks yet; the argument is its label."""
+
+
+OTHER_SEASON = "other"
+OTHER_LABEL = "Other"
+
+
 def _check_level(level: object) -> None:
     if type(level) is not int or not 0 <= level <= 100:
         raise ValueError(f"volume must be an integer 0-100, got {level!r}")
@@ -152,6 +164,32 @@ class Fireplace:
         self._load_music(moods[mood] if mood is not None else [])
         self._update(mood=mood)
 
+    # -- seasons ---------------------------------------------------------
+
+    def seasons(self, moods: dict[str, list[Path]]) -> list[dict]:
+        """Configured seasons in order, plus "other" for folders with tracks in none of them."""
+        if not self.config.seasons:
+            return []
+        out = [
+            {"name": s.name, "label": s.label, "moods": list(s.moods)}
+            for s in self.config.seasons
+        ]
+        listed = {m for s in self.config.seasons for m in s.moods}
+        unlisted = [n for n, tracks in moods.items() if n not in listed and tracks]
+        if unlisted:
+            out.append({"name": OTHER_SEASON, "label": OTHER_LABEL, "moods": unlisted})
+        return out
+
+    def _current_season(self, seasons: list[dict], moods: dict[str, list[Path]], saved: str | None) -> str | None:
+        if not seasons:
+            return None
+        for candidate in (saved, self.config.default_mood):
+            if candidate is not None and candidate in moods:
+                for s in seasons:
+                    if candidate in s["moods"]:
+                        return s["name"]
+        return seasons[0]["name"]
+
     # -- status ----------------------------------------------------------
 
     def status(self) -> dict:
@@ -187,6 +225,7 @@ class Fireplace:
             }
         except (MpvUnavailable, MpvError):
             log = {"available": False}
+        seasons = self.seasons(moods)
         return {
             "moods": [
                 {"name": n, "label": mood_label(n), "tracks": len(t)} for n, t in moods.items()
@@ -194,6 +233,8 @@ class Fireplace:
             "mood": state.mood if state.mood in moods else None,
             "music": music,
             "log": log,
+            "season": self._current_season(seasons, moods, state.mood),
+            "seasons": seasons,
         }
 
     # -- mutators --------------------------------------------------------
@@ -205,6 +246,19 @@ class Fireplace:
         self._load_music(moods[name])
         self.music.set("pause", False)
         self._update(mood=name, music_playing=True)
+
+    def set_season(self, name: str) -> None:
+        moods = find_moods(self.config.music_dir)
+        for season in self.seasons(moods):
+            if season["name"] == name:
+                break
+        else:
+            raise UnknownSeason(name)
+        for mood in season["moods"]:
+            if moods.get(mood):
+                self.set_mood(mood)
+                return
+        raise EmptySeason(season["label"])
 
     def play(self) -> None:
         self.music.set("pause", False)

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from pireplace.config import DEFAULT_ALLOWED_HOSTS
-from pireplace.controller import Fireplace, UnknownMood
+from pireplace.controller import EmptySeason, Fireplace, UnknownMood, UnknownSeason
 from pireplace.mpv import MpvUnavailable
 
 log = logging.getLogger(__name__)
@@ -109,6 +109,12 @@ def make_server(
             raise BadRequest("mood must be a non-empty string")
         return with_status(fireplace.set_mood, mood)
 
+    def api_season(body) -> tuple[int, dict]:
+        season = _require_object(body).get("season")
+        if not isinstance(season, str) or not season:
+            raise BadRequest("season must be a non-empty string")
+        return with_status(fireplace.set_season, season)
+
     def api_music(body) -> tuple[int, dict]:
         action = _require_object(body).get("action")
         actions = {"play": fireplace.play, "pause": fireplace.pause, "next": fireplace.next_track}
@@ -137,6 +143,7 @@ def make_server(
     routes: dict[tuple[str, str], Handler] = {
         ("GET", "/api/status"): api_status,
         ("POST", "/api/mood"): api_mood,
+        ("POST", "/api/season"): api_season,
         ("POST", "/api/music"): api_music,
         ("POST", "/api/volume"): api_volume,
         ("POST", "/api/log"): api_log,
@@ -226,6 +233,10 @@ def make_server(
                 self._send_json(413, {"error": "request body too large"})
             except UnknownMood as e:
                 self._send_json(400, {"error": f"unknown mood: {e}"})
+            except UnknownSeason as e:
+                self._send_json(400, {"error": f"unknown season: {e}"})
+            except EmptySeason as e:
+                self._send_json(409, {"error": f"No music in {e} yet; it arrives with the next sync."})
             except (BadRequest, ValueError) as e:
                 self._send_json(400, {"error": str(e)})
             except MpvUnavailable:
