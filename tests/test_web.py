@@ -483,3 +483,21 @@ def test_post_season_requires_json(srv):
     code, _, _ = request(srv, "POST", "/api/season", b'{"season": "fall"}',
                          headers={"Content-Type": "text/plain"})
     assert code == 415 and srv.stub.calls == []
+
+
+def test_index_has_all_twelve_palette_keys_in_themes():
+    html, css = _index_css()
+    themes = html.split("var THEMES = {")[1].split("var THEME")[0]
+    moods = ("classic-swing", "modern", "soul-motown", "instrumental",
+             "spooky-classics", "monster-party", "graveyard-punk", "goth-night",
+             "harvest", "thanksgiving", "autumn-standards", "four-seasons")
+    for mood in moods:
+        assert f'"{mood}": {{ icon:' in themes
+        assert f'[data-palette="{mood}"]' in css
+
+
+def test_index_has_season_picker_markup():
+    html, _ = _index_css()
+    assert "aria-haspopup" in html
+    assert "aria-expanded" in html
+    assert '"/api/season"' in html

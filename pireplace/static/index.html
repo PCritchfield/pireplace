@@ -23,6 +23,7 @@
     --err: #ff8a7a;
     --snow: transparent;  /* snow dots; only some palettes set these */
     --snow2: transparent;
+    --shadow: rgba(0, 0, 0, .5); /* picker menu */
   }
   /* Christmas theme: one palette per music mood. */
   body[data-theme="christmas"][data-palette="classic-swing"] {
@@ -46,6 +47,48 @@
     --text: #f3efe2; --muted: #bec2b4; --btn: #1a3626; --btn-down: #355e45;
     --accent: #c9302c; --on-accent: #fff6ee; --accent2: #e9d9a8;
     --snow: rgba(255, 255, 255, .4);
+  }
+  /* Halloween theme. */
+  body[data-theme="halloween"][data-palette="spooky-classics"] {
+    --bg: #17122a; --head: #221a3a; --panel: #1e1833; --edge: #3a2f5c;
+    --text: #efeaff; --muted: #b6aed3; --btn: #221a3a; --btn-down: #3a2f5c;
+    --accent: #f2c14e; --on-accent: #17122a; --accent2: #c9b8ff;
+  }
+  body[data-theme="halloween"][data-palette="monster-party"] {
+    --bg: #140d08; --head: #24150a; --panel: #1f130a; --edge: #4a2a12;
+    --text: #fff1e0; --muted: #c9a88a; --btn: #24150a; --btn-down: #4a2a12;
+    --accent: #ff7a1a; --on-accent: #140d08; --accent2: #9be15d;
+  }
+  body[data-theme="halloween"][data-palette="graveyard-punk"] {
+    --bg: #0e0e0e; --head: #1b1b1b; --panel: #161616; --edge: #363636;
+    --text: #f1ede4; --muted: #b3ada0; --btn: #1b1b1b; --btn-down: #363636;
+    --accent: #d7263d; --on-accent: #ffffff; --accent2: #e8e1cf;
+  }
+  body[data-theme="halloween"][data-palette="goth-night"] {
+    --bg: #1a0a14; --head: #2a1020; --panel: #240e1b; --edge: #4a2038;
+    --text: #f3e8ee; --muted: #c4aab8; --btn: #2a1020; --btn-down: #4a2038;
+    --accent: #c9c9d6; --on-accent: #1a0a14; --accent2: #e07aa0;
+  }
+  /* Fall theme. */
+  body[data-theme="fall"][data-palette="harvest"] {
+    --bg: #2a1a0e; --head: #3a2414; --panel: #33200f; --edge: #5a3a1e;
+    --text: #fbefdc; --muted: #c9ad8a; --btn: #3a2414; --btn-down: #5a3a1e;
+    --accent: #e0a83a; --on-accent: #2a1a0e; --accent2: #f0b27a;
+  }
+  body[data-theme="fall"][data-palette="thanksgiving"] {
+    --bg: #2b1210; --head: #3d1a16; --panel: #361613; --edge: #5e2c24;
+    --text: #fbeee6; --muted: #cfa89a; --btn: #3d1a16; --btn-down: #5e2c24;
+    --accent: #e8833a; --on-accent: #2b1210; --accent2: #f2c879;
+  }
+  body[data-theme="fall"][data-palette="autumn-standards"] {
+    --bg: #1f1a14; --head: #2c241b; --panel: #282018; --edge: #4a3c2c;
+    --text: #f6ecdd; --muted: #c3b09a; --btn: #2c241b; --btn-down: #4a3c2c;
+    --accent: #d9902f; --on-accent: #1f1a14; --accent2: #e8c690;
+  }
+  body[data-theme="fall"][data-palette="four-seasons"] {
+    --bg: #1c2116; --head: #283020; --panel: #232b1c; --edge: #42503a;
+    --text: #f1efe2; --muted: #bcbca0; --btn: #283020; --btn-down: #42503a;
+    --accent: #c87533; --on-accent: #1c2116; --accent2: #d9c98a;
   }
   * { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
@@ -72,13 +115,26 @@
     background-position: 13px 27px, 41px 9px, 79px 66px;
   }
   main { max-width: 520px; margin: 0 auto; }
-  .hdr { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin: 0 0 14px;
+  .hdr { position: relative; display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin: 0 0 14px;
          padding: 10px 14px; background: var(--head); border: 1px solid var(--edge);
          border-radius: 14px; transition: background-color .4s, border-color .4s; }
   .ico { flex: none; width: 32px; height: 32px; }
   .ico[hidden] { display: none; }
   h1 { margin: 0; font: 600 1.6rem/1.2 Georgia, "Times New Roman", serif;
        color: var(--accent2); letter-spacing: .02em; transition: color .4s; }
+  .title-btn { min-height: 44px; padding: 0 4px; margin: 0 -4px; background: none; border: 0;
+               border-radius: 8px; font: inherit; color: inherit; letter-spacing: inherit;
+               transition: none; }
+  .title-btn:active:not(:disabled) { background: none; }
+  .chev { font: .6em system-ui, sans-serif; vertical-align: .25em; margin-left: .15em; }
+  .menu { position: absolute; left: 0; top: calc(100% + 6px); z-index: 5; max-width: 100%;
+          min-width: min(240px, 100%); padding: 6px; background: var(--panel);
+          border: 1px solid var(--accent2); border-radius: 12px; box-shadow: 0 10px 24px var(--shadow); }
+  .menu button { display: block; width: 100%; text-align: left; border-color: transparent;
+                 background: none; overflow-wrap: anywhere; }
+  .menu button + button { margin-top: 2px; }
+  .menu button[aria-checked="true"] { background: var(--accent); color: var(--on-accent); }
+  .menu .none { font-weight: 400; font-size: .85rem; }
   .sub { font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .12em;
          color: var(--muted); overflow-wrap: anywhere; }
   h2 { margin: 0 0 10px; font-size: .85rem; font-weight: 600; text-transform: uppercase;
@@ -122,8 +178,10 @@
 <main>
   <header class="hdr">
     <span id="ico" class="ico" aria-hidden="true" hidden></span>
-    <h1>Fireplace</h1>
+    <h1><span id="title-text">Fireplace</span><button id="season-btn" class="title-btn" type="button"
+        aria-haspopup="menu" aria-expanded="false" aria-controls="season-menu" hidden>Fireplace <span class="chev" aria-hidden="true">&#9662;</span></button></h1>
     <span id="sub" class="sub" hidden></span>
+    <div id="season-menu" class="menu" role="menu" aria-label="Season" hidden></div>
   </header>
 
   <section id="music-sec">
@@ -172,17 +230,39 @@
   var timers = {};
 
   // Palettes. THEMES maps a theme name to {mood name -> {icon}}; the colours themselves
-  // live in the CSS under body[data-theme][data-palette]. To add a theme (Thanksgiving,
-  // Halloween...) add a table here, matching CSS blocks, and change THEME.
+  // live in the CSS under body[data-theme][data-palette]. To add a theme add a table here
+  // and matching CSS blocks. Mood names are unique across themes.
   var THEMES = {
     christmas: {
       "classic-swing": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><circle cx="16" cy="18" r="10" fill="#c9302c"/><path d="M16 8v-3m-4 2h8" stroke="#d4a63a" stroke-width="2.5" stroke-linecap="round"/><path d="M9 16q7 4 14 0" stroke="#d4a63a" stroke-width="1.6" fill="none"/></svg>' },
       "modern": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><g stroke="#dfe9f5" stroke-width="2" stroke-linecap="round"><path d="M16 4v24M5.6 10l20.8 12M5.6 22l20.8-12"/><path d="M13 6l3 3 3-3M13 26l3-3 3 3"/></g></svg>' },
       "soul-motown": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><circle cx="16" cy="16" r="12" fill="#111" stroke="#ff8a8a" stroke-width="1.5"/><circle cx="16" cy="16" r="8.5" fill="none" stroke="#7a5a68"/><circle cx="16" cy="16" r="4" fill="#e0a14d"/><circle cx="16" cy="16" r="1" fill="#111"/></svg>' },
       "instrumental": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 3l7 10h-4l6 8h-5l5 7H7l5-7H7l6-8H9z" fill="#2f7a4b"/><rect x="14" y="27" width="4" height="3" fill="#7a4a24"/><circle cx="16" cy="3" r="2" fill="#e9d9a8"/></svg>' }
+    },
+    halloween: {
+      "spooky-classics": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M20 4a12 12 0 1 0 8 20A10 10 0 0 1 20 4z" fill="#f2c14e"/><path d="M6 10l3 1 2-2 2 2 3-1-2 3h-6z" fill="#c9b8ff"/></svg>' },
+      "monster-party": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 7c-1-3 1-4 3-4" stroke="#9be15d" stroke-width="2" fill="none"/><ellipse cx="16" cy="18" rx="12" ry="10" fill="#ff7a1a"/><path d="M10 15l3 3h-3zM22 15l-3 3h3zM10 22q6 4 12 0l-2 1-2-1-2 1-2-1-2 1z" fill="#140d08"/></svg>' },
+      "graveyard-punk": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 4c-7 0-11 5-11 11 0 4 2 6 4 7v5h14v-5c2-1 4-3 4-7 0-6-4-11-11-11z" fill="#e8e1cf"/><circle cx="11.5" cy="16" r="3" fill="#0e0e0e"/><circle cx="20.5" cy="16" r="3" fill="#0e0e0e"/><path d="M16 19l-2 3h4z" fill="#0e0e0e"/><path d="M12 25v2M16 25v2M20 25v2" stroke="#0e0e0e" stroke-width="1.5"/></svg>' },
+      "goth-night": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 12c-2 0-3 2-3 2-3-4-8-5-11-3 3 1 4 3 4 6 2-2 5-2 7 1l3 3 3-3c2-3 5-3 7-1 0-3 1-5 4-6-3-2-8-1-11 3 0 0-1-2-3-2z" fill="#c9c9d6"/><circle cx="14.5" cy="15" r=".9" fill="#e07aa0"/><circle cx="17.5" cy="15" r=".9" fill="#e07aa0"/></svg>' }
+    },
+    fall: {
+      "harvest": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><g stroke="#e0a83a" stroke-width="2" stroke-linecap="round" fill="none"><path d="M16 29V10M16 29l-6-15M16 29l6-15"/></g><g fill="#e0a83a"><ellipse cx="16" cy="7" rx="2.2" ry="4"/><ellipse cx="9.5" cy="11" rx="2" ry="3.6" transform="rotate(-25 9.5 11)"/><ellipse cx="22.5" cy="11" rx="2" ry="3.6" transform="rotate(25 22.5 11)"/></g><path d="M11 22h10" stroke="#c1502e" stroke-width="2.5"/></svg>' },
+      "thanksgiving": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M4 22L28 12v6L4 28z" fill="#f2c879"/><path d="M4 22L28 12l-2-3L4 19z" fill="#e8833a"/><path d="M4 28l24-10v3L4 30z" fill="#a5532a"/></svg>' },
+      "autumn-standards": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M16 3l2 6 4-3-1 5 5-1-3 5 4 2-6 2 1 4-5-2-1 7-1-7-5 2 1-4-6-2 4-2-3-5 5 1-1-5 4 3z" fill="#d9902f"/><path d="M16 15v14" stroke="#e8c690" stroke-width="1.5"/></svg>' },
+      "four-seasons": { icon: '<svg viewBox="0 0 32 32" width="32" height="32"><path d="M12 6c-3 0-4 4-2 6-3 2-3 7 0 9-2 3 0 7 4 7s6-4 4-7c3-2 3-7 0-9 2-2 1-6-2-6z" fill="#c87533"/><path d="M14 9v16" stroke="#1c2116" stroke-width="1.2"/><path d="M22 4L13 27" stroke="#d9c98a" stroke-width="1.5"/></svg>' }
     }
   };
-  var THEME = "christmas";
+
+  // Which theme a mood belongs to ("" when none: the default fire palette).
+  function themeFor(mood) {
+    for (var t in THEMES) {
+      if (Object.prototype.hasOwnProperty.call(THEMES, t) &&
+          Object.prototype.hasOwnProperty.call(THEMES[t], mood)) { return t; }
+    }
+    return "";
+  }
+
+  var menuOpen = false;
 
   function api(method, path, body) {
     var opts = { method: method, headers: {} };
@@ -210,29 +290,118 @@
   var shownPalette = null;  // key of the palette currently applied ("" = default)
 
   function setPalette(s) {
-    var table = THEMES[THEME] || {};
-    var p = Object.prototype.hasOwnProperty.call(table, s.mood) ? table[s.mood] : null;
+    var theme = themeFor(s.mood);
+    var p = theme ? THEMES[theme][s.mood] : null;
     var label = "";
     (s.moods || []).forEach(function (m) { if (m.name === s.mood) { label = m.label; } });
-    var key = p ? THEME + "/" + s.mood + "|" + label : "";
+    var season = currentSeason(s);
+    // With seasons the subtitle is "Season · Mood"; without, just the mood (themed moods only).
+    var subText = season ? (label ? season.label + " · " + label : season.label)
+                         : (p ? label : "");
+    var key = (p ? theme + "/" + s.mood : "") + "|" + subText;
     if (key === shownPalette) { return; }  // unchanged since the last render
     shownPalette = key;
     var body = document.body, ico = $("ico"), sub = $("sub");
-    if (p) { body.setAttribute("data-theme", THEME); body.setAttribute("data-palette", s.mood); }
+    if (p) { body.setAttribute("data-theme", theme); body.setAttribute("data-palette", s.mood); }
     else { body.removeAttribute("data-theme"); body.removeAttribute("data-palette"); }
     // The icons are fixed strings from the table above, never server data.
     ico.innerHTML = p ? p.icon : "";
     ico.hidden = !p;
-    sub.textContent = p ? label : "";
-    sub.hidden = !(p && label);
+    sub.textContent = subText;  // labels come from config/folder names: text only
+    sub.hidden = !subText;
     // Custom properties resolve at once (only the painted colours transition).
     var bg = getComputedStyle(body).getPropertyValue("--bg").trim();
     document.querySelector('meta[name="theme-color"]').setAttribute("content", bg);
   }
 
+  function currentSeason(s) {
+    var found = null;
+    (s.seasons || []).forEach(function (x) { if (x.name === s.season) { found = x; } });
+    return found;
+  }
+
+  function seasonHasMusic(season, s) {
+    var tracks = {};
+    (s.moods || []).forEach(function (m) { tracks[m.name] = m.tracks; });
+    return (season.moods || []).some(function (n) { return tracks[n] > 0; });
+  }
+
+  // Season picker: the title becomes a button only when there is something to pick.
+  function closeMenu(refocus) {
+    if (!menuOpen) { return; }
+    menuOpen = false;
+    $("season-menu").hidden = true;
+    $("season-btn").setAttribute("aria-expanded", "false");
+    if (refocus) { $("season-btn").focus(); }
+  }
+
+  function buildMenu(s) {
+    var menu = $("season-menu");
+    while (menu.firstChild) { menu.removeChild(menu.firstChild); }
+    (s.seasons || []).forEach(function (x) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.setAttribute("role", "menuitemradio");
+      b.setAttribute("aria-checked", String(x.name === s.season));
+      b.appendChild(document.createTextNode(x.label));
+      if (!seasonHasMusic(x, s)) {
+        b.disabled = true;
+        var note = document.createElement("span");
+        note.className = "none";
+        note.textContent = " (no music yet)";
+        b.appendChild(note);
+      }
+      b.addEventListener("click", function () {
+        closeMenu(true);
+        if (x.name !== (current && current.season)) { act("POST", "/api/season", { season: x.name }); }
+      });
+      menu.appendChild(b);
+    });
+  }
+
+  function renderPicker(s) {
+    var pick = (s.seasons || []).length > 1;
+    $("season-btn").hidden = !pick;
+    $("title-text").hidden = pick;
+    if (!pick) { closeMenu(false); }
+    else if (!menuOpen) { buildMenu(s); }  // an open menu is left alone until it closes
+  }
+
+  function openMenu() {
+    if (menuOpen || !current) { return; }
+    buildMenu(current);
+    menuOpen = true;
+    $("season-menu").hidden = false;
+    $("season-btn").setAttribute("aria-expanded", "true");
+    var items = $("season-menu").querySelectorAll("button:not(:disabled)");
+    var first = $("season-menu").querySelector('[aria-checked="true"]:not(:disabled)') || items[0];
+    if (first) { first.focus(); }
+  }
+
+  $("season-btn").addEventListener("click", function () {
+    if (menuOpen) { closeMenu(false); } else { openMenu(); }
+  });
+  document.addEventListener("click", function (e) {
+    if (menuOpen && !$("season-menu").contains(e.target) && !$("season-btn").contains(e.target)) {
+      closeMenu(false);
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (!menuOpen) { return; }
+    if (e.key === "Escape") { closeMenu(true); return; }
+    var dir = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
+    if (!dir) { return; }
+    var items = Array.prototype.slice.call($("season-menu").querySelectorAll("button:not(:disabled)"));
+    if (!items.length) { return; }
+    e.preventDefault();
+    var i = items.indexOf(document.activeElement);
+    items[(i + dir + items.length) % items.length].focus();
+  });
+
   function render(s) {
     current = s;
     setPalette(s);
+    renderPicker(s);
     var music = s.music || {}, log = s.log || {};
 
     // music
@@ -248,6 +417,13 @@
     // moods
     var wrap = $("moods");
     var moods = s.moods || [];
+    var season = currentSeason(s);
+    if (season) {  // only this season's moods, in the season's order
+      var byName = {};
+      moods.forEach(function (m) { byName[m.name] = m; });
+      moods = (season.moods || []).filter(function (n) { return byName[n]; })
+        .map(function (n) { return byName[n]; });
+    }
     while (wrap.firstChild) { wrap.removeChild(wrap.firstChild); }
     moods.forEach(function (m) {
       var b = document.createElement("button");
