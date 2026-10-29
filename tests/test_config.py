@@ -262,6 +262,12 @@ def test_season_rejects_bad_names(tmp_path, body):
         load_config(_write(tmp_path, body))
 
 
+def test_season_name_other_is_reserved(tmp_path):
+    p = _write(tmp_path, '[seasons.other]\nlabel = "Misc"\nmoods = ["a"]\n')
+    with pytest.raises(ConfigError, match="reserved"):
+        load_config(p)
+
+
 # --- jellyfin audio profile ---
 
 def _jf(tmp_path, extra=""):

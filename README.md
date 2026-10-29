@@ -113,8 +113,8 @@ pireplace_seasons_custom:
 Each mood belongs to at most one season, and must be a playlist in
 `pireplace_jellyfin_playlists` (sync on) or listed in `pireplace_moods`; the deploy
 checks names, labels and moods before it changes anything. Music folders that are in no
-season show up under an automatic "Other" season. This renders `[seasons.<name>]` tables
-(`label`, `moods`) in `/etc/pireplace/config.toml`; table order is display order. The
+season show up under an automatic "Other" season, so `other` is not a valid season
+name. This renders `[seasons.<name>]` tables (`label`, `moods`) in `/etc/pireplace/config.toml`; table order is display order. The
 current season is the one holding the current mood (else `default_mood`, else the first
 season).
 

@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
-from pireplace.config import Config
+from pireplace.config import RESERVED_SEASON, Config
 from pireplace.library import find_moods, find_videos, mood_label
 from pireplace.mpv import MpvClient, MpvError, MpvUnavailable
 from pireplace.state import State, StateStore
@@ -31,7 +31,7 @@ class EmptySeason(Exception):
     """The season has no mood with tracks yet; the argument is its label."""
 
 
-OTHER_SEASON = "other"
+OTHER_SEASON = RESERVED_SEASON
 OTHER_LABEL = "Other"
 
 

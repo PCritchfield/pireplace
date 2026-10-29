@@ -12,6 +12,7 @@ from pathlib import Path
 
 DEFAULT_ALLOWED_HOSTS = ("pireplace.local", "pireplace", "localhost", "127.0.0.1")
 DEFAULT_HOTSPOT_ADDRESS = "10.42.0.1"  # NetworkManager's address for a shared (hotspot) connection
+RESERVED_SEASON = "other"  # the control page's automatic bucket for folders in no season
 
 
 class ConfigError(Exception):
@@ -127,6 +128,10 @@ def _parse_seasons(raw: object) -> tuple[Season, ...]:
     for name, table in raw.items():
         if not _MOOD_NAME.fullmatch(name):
             raise ConfigError(f"seasons: invalid season name {name!r}")
+        if name == RESERVED_SEASON:
+            raise ConfigError(
+                f"seasons: the name {name!r} is reserved for folders that are in no season"
+            )
         if not isinstance(table, dict):
             raise ConfigError(f"seasons.{name}: expected a table")
         label = _coerce(f"seasons.{name}.label", table.get("label"), "str", None, None)

@@ -998,6 +998,50 @@ def test_season_preflight_rejects_a_bad_season_name(name):
     assert any("bad_names" in c for c in _failing(_custom(name=name, moods=["modern"])))
 
 
+def test_season_preflight_reserves_the_name_other():
+    """"other" is the automatic bucket for folders in no season."""
+    assert any("bad_names" in c for c in _failing(_custom(name="other", moods=["modern"])))
+    assert not _failing(_custom(name="others", moods=["modern"]))
+
+
+def _audio_checks(extra: dict) -> list:
+    templar, trust = _templar({"pireplace_jellyfin_api_key": "k", **extra})
+    task = _task("Require a valid Jellyfin audio format")
+    assert templar.template(trust("{{ " + task["when"] + " }}")) is True
+    return [templar.template(trust("{{ " + c + " }}"))
+            for c in task["ansible.builtin.assert"]["that"]]
+
+
+def test_audio_preflight_only_runs_with_the_sync():
+    templar, trust = _templar({})
+    task = _task("Require a valid Jellyfin audio format")
+    assert templar.template(trust("{{ " + task["when"] + " }}")) is False
+
+
+@pytest.mark.parametrize("extra", [
+    {},
+    {"pireplace_jellyfin_audio_format": "original"},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 64},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 320},
+    {"pireplace_jellyfin_audio_bitrate_kbps": "96"},  # -e on the command line is a string
+])
+def test_audio_preflight_accepts_valid_settings(extra):
+    assert all(v is True for v in _audio_checks(extra))
+
+
+@pytest.mark.parametrize("extra", [
+    {"pireplace_jellyfin_audio_format": "mp3"},
+    {"pireplace_jellyfin_audio_format": "Opus"},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 63},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 321},
+    {"pireplace_jellyfin_audio_bitrate_kbps": "abc"},
+    {"pireplace_jellyfin_audio_bitrate_kbps": 96.5},
+    {"pireplace_jellyfin_audio_bitrate_kbps": True},
+])
+def test_audio_preflight_rejects_bad_settings(extra):
+    assert not all(v is True for v in _audio_checks(extra))
+
+
 @pytest.mark.parametrize("label", ["", "   ", 5])
 def test_season_preflight_rejects_a_bad_label(label):
     assert any("bad_labels" in c for c in _failing(_custom(label=label, moods=["modern"])))
