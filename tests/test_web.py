@@ -404,3 +404,48 @@ def test_index_page_posts_send_json_content_type():
 
     html = INDEX_HTML.read_text()
     assert 'act("POST", "/api/rescan")' not in html  # every POST carries a JSON body
+
+
+def _index_css():
+    from pireplace.web import INDEX_HTML
+
+    html = INDEX_HTML.read_text()
+    return html, html.split("<style>")[1].split("</style>")[0]
+
+
+def test_index_page_has_a_palette_for_every_mood():
+    html, css = _index_css()
+    for mood in ("classic-swing", "modern", "soul-motown", "instrumental"):
+        assert f'"{mood}":' in html  # JS palette table key
+        assert f'[data-palette="{mood}"]' in css  # CSS override block
+
+
+def test_index_page_default_palette_is_in_root():
+    _, css = _index_css()
+    root = css.split(":root {")[1].split("}")[0]
+    for var in ("--bg", "--head", "--panel", "--edge", "--text", "--muted", "--btn",
+                "--btn-down", "--accent", "--on-accent", "--accent2", "--warn", "--err"):
+        assert f"{var}:" in root
+    assert "--bg: #1a0f0a" in root  # today's fire palette stays the default
+
+
+def test_index_page_loads_nothing_external():
+    html, _ = _index_css()
+    assert "http://" not in html and "https://" not in html
+    assert "<link" not in html and "@import" not in html and "src=" not in html
+
+
+def test_index_page_css_has_no_hardcoded_colours_outside_variables():
+    import re
+
+    _, css = _index_css()
+    for line in css.splitlines():
+        # Colour values may only appear in custom-property declarations.
+        rest = re.sub(r"--[\w-]+:[^;}]*;?", "", line)
+        assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", rest), line
+
+
+def test_index_page_keeps_theme_color_meta():
+    html, _ = _index_css()
+    assert '<meta name="theme-color" content="#1a0f0a">' in html
+    assert "prefers-reduced-motion" in html
